@@ -4,3 +4,5 @@ Output/*
 # Vendor binaries are copied in by hand
 Tools/*
 !Tools/README.txt
+# Group tags you add in the GUI
+Config/grouptags.user.json

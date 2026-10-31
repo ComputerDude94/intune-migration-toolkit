@@ -75,6 +75,13 @@ function Set-StepState {
     ConvertTo-Json -InputObject $all -Depth 3 | Set-Content -Path $script:StatePath -Encoding UTF8
 }
 
+function Clear-StepState {
+    param([Parameter(Mandatory)][string]$Step)
+    if ($script:DryRun) { return }
+    $all = @(Get-StepState | Where-Object { $_.Step -ne $Step })
+    ConvertTo-Json -InputObject $all -Depth 3 | Set-Content -Path $script:StatePath -Encoding UTF8
+}
+
 # Wraps anything that changes the machine so dry-run mode can log instead of act.
 function Invoke-Mutation {
     param([Parameter(Mandatory)][string]$Description, [Parameter(Mandatory)][scriptblock]$Action)
@@ -86,6 +93,130 @@ function Invoke-Mutation {
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# ----------------------------------------------------------------------------- device scope guard
+# The toolkit only ever changes the computer it is running on. No function here takes a computer name, opens a
+# remote session or touches another machine, so a signed-in network account is never used to reach beyond this device.
+# These helpers make that explicit and refuse contexts that could blur it.
+
+function Test-NetworkPath {
+    param([string]$Path)
+    if ($Path -like '\\*') { return $true }
+    try {
+        $root = [IO.Path]::GetPathRoot($Path)
+        if ($root -match '^([A-Za-z]:)\\?$') {
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($Matches[1])'" -ErrorAction Stop
+            return ($disk.DriveType -eq 4)
+        }
+    } catch {}
+    $false
+}
+
+function Assert-LocalScope {
+    if (Get-Variable -Name PSSenderInfo -Scope Global -ErrorAction SilentlyContinue) {
+        throw 'Refusing to run: this is a remote PowerShell session. The toolkit only changes the device it runs on, so run it locally on that device.'
+    }
+    if (Test-NetworkPath $script:ToolkitRoot) {
+        throw "Refusing to make changes while running from a network location ($($script:ToolkitRoot)). Copy the toolkit to a local drive (for example C:\MigrationToolkit) and run it from there."
+    }
+}
+
+function Get-ToolkitTarget {
+    $serial = ''; $guid = ''
+    try { $serial = "$((Get-CimInstance Win32_BIOS -ErrorAction Stop).SerialNumber)".Trim() } catch {}
+    try { $guid = "$((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid)" } catch {}
+    [pscustomobject]@{
+        ComputerName   = $env:COMPUTERNAME
+        Serial         = $serial
+        MachineGuid    = $guid
+        User           = "$env:USERDOMAIN\$env:USERNAME"
+        NetworkAccount = [bool]($env:USERDOMAIN -and $env:USERDOMAIN -ne $env:COMPUTERNAME -and $env:USERDOMAIN -notin 'AzureAD', 'NT AUTHORITY')
+    }
+}
+
+# ----------------------------------------------------------------------------- group tags
+# Tags come from Config\toolkit.json (built in) plus any the user adds (Config\grouptags.user.json,
+# or ProgramData when the toolkit folder is read-only).
+
+$script:AdminMarker = 'Temporary migration admin (remove after migration)'
+
+function Get-UserTagPath {
+    @((Join-Path $script:ToolkitRoot 'Config\grouptags.user.json'), (Join-Path $script:DataRoot 'grouptags.user.json'))
+}
+
+function Read-UserGroupTag {
+    $tags = New-Object System.Collections.Generic.List[string]
+    foreach ($p in (Get-UserTagPath)) {
+        if (-not (Test-Path $p)) { continue }
+        try {
+            $j = Get-Content $p -Raw | ConvertFrom-Json
+            foreach ($t in @($j.tags)) { $s = "$t".Trim(); if ($s -and ($tags -notcontains $s)) { $tags.Add($s) } }
+        } catch { Write-ToolkitLog "Ignoring unreadable tag file $p" 'WARN' }
+    }
+    $tags.ToArray()
+}
+
+function Get-GroupTagList {
+    $all = New-Object System.Collections.Generic.List[string]
+    foreach ($t in (@((Get-ToolkitConfig).groupTags) + @(Read-UserGroupTag))) {
+        $s = "$t".Trim()
+        if ($s -and ($all -notcontains $s)) { $all.Add($s) }
+    }
+    $all.ToArray()
+}
+
+# Returns an error message, or an empty string when the name is acceptable.
+function Test-GroupTagName {
+    param([string]$Name)
+    $n = "$Name".Trim()
+    if (-not $n) { return 'Enter a group tag.' }
+    if ($n.Length -gt 128) { return 'A group tag can be at most 128 characters.' }
+    if ($n -notmatch '^[A-Za-z0-9][A-Za-z0-9 _.\-]*$') { return 'Use letters, numbers, spaces, hyphens, underscores and dots only (start with a letter or number).' }
+    ''
+}
+
+function Save-UserGroupTag {
+    param([string[]]$Tags)
+    $json = ConvertTo-Json -InputObject @{ tags = @($Tags) } -Depth 3
+    foreach ($p in (Get-UserTagPath)) {
+        try {
+            $dir = Split-Path $p
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            Set-Content -Path $p -Value $json -Encoding UTF8
+            return $p
+        } catch {}
+    }
+    throw 'Could not save the group tag (no writable location).'
+}
+
+function Add-GroupTag {
+    param([Parameter(Mandatory)][string]$Name)
+    $n = $Name.Trim()
+    $err = Test-GroupTagName $n
+    if ($err) { throw "Invalid group tag '$n': $err" }
+    $existing = @(Get-GroupTagList | Where-Object { $_ -ieq $n })
+    if ($existing.Count -gt 0) { Write-ToolkitLog "Group tag '$($existing[0])' already exists."; return $existing[0] }
+    $where = Save-UserGroupTag (@(Read-UserGroupTag) + $n)
+    Write-ToolkitLog "Group tag '$n' saved ($where)." 'OK'
+    $n
+}
+
+function Remove-GroupTag {
+    param([Parameter(Mandatory)][string]$Name)
+    $n = $Name.Trim()
+    if (@((Get-ToolkitConfig).groupTags | Where-Object { $_ -ieq $n }).Count -gt 0) { throw "'$n' is a built-in tag from Config\toolkit.json. Edit that file to remove it." }
+    $removed = $false
+    foreach ($p in (Get-UserTagPath)) {
+        if (-not (Test-Path $p)) { continue }
+        try {
+            $keep = @((Get-Content $p -Raw | ConvertFrom-Json).tags | Where-Object { $_ -and $_ -ine $n })
+            ConvertTo-Json -InputObject @{ tags = $keep } -Depth 3 | Set-Content -Path $p -Encoding UTF8
+            $removed = $true
+        } catch {}
+    }
+    if ($removed) { Write-ToolkitLog "Group tag '$n' removed from your saved tags. CSV files already written keep their tag." 'OK' }
+    else { Write-ToolkitLog "Group tag '$n' was not in your saved tags." 'WARN' }
 }
 
 # ----------------------------------------------------------------------------- helpers
@@ -223,7 +354,18 @@ function Get-PreflightReport {
     $build = [int]$os.BuildNumber
     $r.Add((New-Check 'Windows version' $(if ($build -ge 19044) { 'Pass' } else { 'Warn' }) "$($os.Caption) build $build (21H2 / build 19044 or newer recommended)"))
 
-    $r.Add((New-Check 'Serial number' 'Info' ((Get-CimInstance Win32_BIOS).SerialNumber.Trim())))
+    $tg = Get-ToolkitTarget
+    $r.Add((New-Check 'Target device' 'Info' "$($tg.ComputerName), serial $($tg.Serial). Every change is made to this device only."))
+
+    $remote = [bool](Get-Variable -Name PSSenderInfo -Scope Global -ErrorAction SilentlyContinue)
+    $r.Add((New-Check 'Local session' $(if ($remote) { 'Fail' } else { 'Pass' }) $(if ($remote) { 'Remote PowerShell session: run the toolkit on the device itself' } else { 'Not a remote session' })))
+    $onNet = Test-NetworkPath $script:ToolkitRoot
+    $r.Add((New-Check 'Toolkit location' $(if ($onNet) { 'Fail' } else { 'Pass' }) $(if ($onNet) { "Running from a network path ($($script:ToolkitRoot)); copy it to a local drive first" } else { $script:ToolkitRoot })))
+    if ($tg.NetworkAccount) {
+        $r.Add((New-Check 'Signed-in account' 'Warn' "$($tg.User) is a network (domain) account. Its profile will not be usable once the device leaves the domain; plan to continue with the local admin."))
+    } else {
+        $r.Add((New-Check 'Signed-in account' 'Info' $tg.User))
+    }
 
     $bat = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
     if ($bat) {
@@ -278,8 +420,29 @@ function Get-PreflightReport {
 
 # ----------------------------------------------------------------------------- Workspace ONE / SCCM removal
 
+function Test-SafeCleanupPath {
+    param([string]$Path)
+    if (-not $Path -or $Path -match '[\*\?]') { return $false }
+    $deny = 'Microsoft', 'Windows', 'Classes', 'Policies', 'WOW6432Node', 'Clients', 'RegisteredApplications', 'Common Files', 'WindowsApps', 'Package Cache', 'Packages', 'Microsoft Corporation'
+    if ($Path -like 'HKLM:*') {
+        if ($Path -match '^HKLM:\\SOFTWARE\\(?:WOW6432Node\\)?(?<k>[^\\]+)(\\.*)?$') { return ($Matches['k'] -notin $deny) }
+        return $false
+    }
+    try { $full = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($Path)).TrimEnd('\') } catch { return $false }
+    foreach ($root in @($env:ProgramData, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $root) { continue }
+        $r = $root.TrimEnd('\') + '\'
+        if ($full.StartsWith($r, [StringComparison]::OrdinalIgnoreCase) -and $full.Length -gt $r.Length) {
+            return ($full.Substring($r.Length).Split('\')[0] -notin $deny)
+        }
+    }
+    $false
+}
+
 function Remove-MdmEnrollmentArtifact {
-    param([Parameter(Mandatory)][string]$EnrollmentId)
+    param([Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f-]{36}$')][string]$EnrollmentId)
+    $provider = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Enrollments\$EnrollmentId" -ErrorAction SilentlyContinue).ProviderID
+    if ($provider -eq 'MS DM Server') { throw "Refusing to remove enrollment ${EnrollmentId}: it is the Intune enrollment." }
     $regPaths = @(
         "HKLM:\SOFTWARE\Microsoft\Enrollments\$EnrollmentId",
         "HKLM:\SOFTWARE\Microsoft\Enrollments\Status\$EnrollmentId",
@@ -385,6 +548,7 @@ function Remove-WorkspaceOne {
 
     foreach ($rawPath in $cfg.ws1CleanupPaths) {
         $path = [Environment]::ExpandEnvironmentVariables($rawPath)
+        if (-not (Test-SafeCleanupPath $rawPath)) { Write-ToolkitLog "Skipping cleanup path outside the allowed areas: $rawPath" 'WARN'; continue }
         if (Test-Path $path) { Invoke-Mutation "remove leftover $path" { Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue } | Out-Null }
     }
 
@@ -433,15 +597,26 @@ function Remove-SccmClient {
 
 # ----------------------------------------------------------------------------- local admin / domain unjoin / restart
 
+function Get-ToolkitAdminName {
+    $n = "$((Get-ToolkitConfig).localAdminName)".Trim()
+    if ($n -notmatch '^[A-Za-z][A-Za-z0-9_.-]{0,19}$' -or $n -in 'Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount', 'SYSTEM') {
+        throw "localAdminName '$n' in Config\toolkit.json is not allowed. Use a new account name such as MigAdmin."
+    }
+    $n
+}
+
 function New-ToolkitLocalAdmin {
     param([Parameter(Mandatory)][securestring]$Password)
-    $name = (Get-ToolkitConfig).localAdminName
+    $name = Get-ToolkitAdminName
     $u = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+    if ($u -and $u.Description -ne $script:AdminMarker) {
+        throw "A local account named '$name' already exists and was not created by this toolkit, so it will not be changed. Pick another localAdminName in Config\toolkit.json."
+    }
     if ($u) {
         Invoke-Mutation "reset password and enable local account '$name'" { Set-LocalUser -Name $name -Password $Password; Enable-LocalUser -Name $name } | Out-Null
     } else {
         Invoke-Mutation "create local administrator '$name'" {
-            New-LocalUser -Name $name -Password $Password -PasswordNeverExpires -AccountNeverExpires -Description 'Temporary migration admin (remove after migration)' | Out-Null
+            New-LocalUser -Name $name -Password $Password -PasswordNeverExpires -AccountNeverExpires -Description $script:AdminMarker | Out-Null
             Add-LocalGroupMember -Group 'Administrators' -Member $name
         } | Out-Null
     }
@@ -449,11 +624,12 @@ function New-ToolkitLocalAdmin {
 }
 
 function Remove-ToolkitLocalAdmin {
-    $name = (Get-ToolkitConfig).localAdminName
-    if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) {
-        Invoke-Mutation "delete local account '$name'" { Remove-LocalUser -Name $name } | Out-Null
-        Write-ToolkitLog "Local admin '$name' removed." 'OK'
-    } else { Write-ToolkitLog "Local account '$name' does not exist." }
+    $name = Get-ToolkitAdminName
+    $u = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+    if (-not $u) { Write-ToolkitLog "Local account '$name' does not exist."; return }
+    if ($u.Description -ne $script:AdminMarker) { throw "Local account '$name' was not created by this toolkit, so it will not be deleted." }
+    Invoke-Mutation "delete local account '$name'" { Remove-LocalUser -Name $name } | Out-Null
+    Write-ToolkitLog "Local admin '$name' removed." 'OK'
 }
 
 function Invoke-DomainUnjoin {
@@ -463,7 +639,10 @@ function Invoke-DomainUnjoin {
     $admins = @(Get-LocalAdminCandidate)
     if ($admins.Count -eq 0) { throw 'Refusing to unjoin: no enabled local administrator exists. Create one first (Maintenance tab).' }
     Write-ToolkitLog "Local admin(s) available after unjoin: $($admins -join ', ')"
-    if (-not $Credential -and -not $OfflineUnjoin) { throw 'AD credentials are required (or choose offline unjoin).' }
+    $hasCred = [bool]($Credential -and $Credential.UserName)
+    if (-not $hasCred -and -not $OfflineUnjoin) { throw 'AD credentials are required (or choose offline unjoin).' }
+    # Remove-Computer is called without -ComputerName on purpose: it can only act on this device.
+    # The domain credential is used for that one call (to delete this computer's own AD object) and is not kept.
 
     $js = Get-JoinState
     if ($js.AzureAdJoined) { Invoke-Mutation 'run dsregcmd /leave (hybrid join cleanup)' { & dsregcmd.exe /leave | Out-Null } | Out-Null }
@@ -499,10 +678,12 @@ function Start-EntraJoin {
     $js = Get-JoinState
     if ($js.AzureAdJoined) { Write-ToolkitLog "Already Entra joined (tenant: $($js.TenantName))." 'OK'; Set-StepState 'JoinEntra' 'Done'; return }
     if ($js.DomainJoined) { throw 'Device is still domain joined. Unjoin Active Directory and restart first.' }
+    if (-not (Test-TcpPort 'login.microsoftonline.com' 443)) { throw 'Cannot reach login.microsoftonline.com:443. Fix the network connection before joining Entra ID.' }
 
     $ppkg = @(Get-ChildItem -Path (Join-Path $script:ToolkitRoot 'Tools') -Filter '*.ppkg' -ErrorAction SilentlyContinue)
+    if ($ppkg.Count -gt 1) { Write-ToolkitLog "More than one .ppkg in Tools\ - using $($ppkg[0].Name). Remove the others to be sure which tenant you join." 'WARN' }
     if ($ppkg.Count -gt 0) {
-        Write-ToolkitLog "Provisioning package found: $($ppkg[0].Name) - installing silently" 'STEP'
+        Write-ToolkitLog "Provisioning package found: $($ppkg[0].Name) sha256=$((Get-FileHash -Path $ppkg[0].FullName -Algorithm SHA256).Hash) - installing silently" 'STEP'
         Invoke-Mutation "install provisioning package $($ppkg[0].Name)" { Install-ProvisioningPackage -PackagePath $ppkg[0].FullName -QuietInstall -ForceInstall -ErrorAction Stop } | Out-Null
     } else {
         Write-ToolkitLog 'Opening Settings > Accounts > Access work or school. Choose Connect, then "Join this device to Microsoft Entra ID" and sign in.' 'STEP'
@@ -646,12 +827,26 @@ function Save-AutopilotRow {
     $rows | Export-Csv -Path $Path -NoTypeInformation -Encoding ASCII
 }
 
+function Get-HashCsvPath {
+    param([string]$OutputFolder)
+    if (-not $OutputFolder) { $OutputFolder = Join-Path $script:ToolkitRoot 'Output\Autopilot' }
+    $serial = (Get-CimInstance Win32_BIOS).SerialNumber.Trim()
+    Join-Path $OutputFolder ("{0}_AutoPilotSetup.csv" -f ($serial -replace '[^\w-]', '_'))
+}
+
 function Invoke-AutopilotCapture {
     param([string]$GroupTag = '', [string]$OutputFolder)
     if (-not $OutputFolder) { $OutputFolder = Join-Path $script:ToolkitRoot 'Output\Autopilot' }
+    $GroupTag = "$GroupTag".Trim()
     if (-not $GroupTag) { Write-ToolkitLog 'No group tag selected - the device will be captured with an empty tag.' 'WARN' }
+    else {
+        $err = Test-GroupTagName $GroupTag
+        if ($err) { throw "Group tag '$GroupTag' is not valid: $err" }
+        if ((Get-GroupTagList) -notcontains $GroupTag) { Write-ToolkitLog "Group tag '$GroupTag' is not in your saved list (use Add group tag to keep it)." 'WARN' }
+    }
+    if (Test-NetworkPath $OutputFolder) { Write-ToolkitLog "Output folder $OutputFolder is a network location; the file is written with the signed-in account's network access." 'WARN' }
     $info = Get-AutopilotHardwareInfo
-    $file = Join-Path $OutputFolder ("{0}_AutoPilotSetup.csv" -f ($info.Serial -replace '[^\w-]', '_'))
+    $file = Get-HashCsvPath -OutputFolder $OutputFolder
     Invoke-Mutation "write hardware hash for serial $($info.Serial) to $file" {
         if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
         Save-AutopilotRow -Path $file -Info $info -GroupTag $GroupTag
@@ -677,7 +872,7 @@ function Test-AutopilotRow {
 function Merge-AutopilotCsv {
     param([Parameter(Mandatory)][string]$Folder, [string]$OutputPath)
     if (-not (Test-Path $Folder)) { throw "Folder not found: $Folder" }
-    $tags = @((Get-ToolkitConfig).groupTags)
+    $tags = @(Get-GroupTagList)
     $byKey = [ordered]@{}
     $files = @(Get-ChildItem -Path $Folder -Filter '*.csv' | Where-Object { $_.Name -notlike 'Consolidated*' })
     if ($files.Count -eq 0) { throw "No source CSV files in $Folder (files named Consolidated* are ignored)." }
@@ -733,7 +928,7 @@ function Import-AutopilotToIntune {
     param([Parameter(Mandatory)][string]$CsvPath, [int]$TimeoutMin = 20)
     if (-not (Test-Path $CsvPath)) { throw "CSV not found: $CsvPath" }
     $rows = @(Import-Csv $CsvPath)
-    $tags = @((Get-ToolkitConfig).groupTags)
+    $tags = @(Get-GroupTagList)
     foreach ($row in $rows) {
         $p = @(Test-AutopilotRow -Row $row -KnownGroupTags $tags)
         if ($p | Where-Object { $_ -like 'missing*' -or $_ -like '*base64*' }) { throw "Invalid row for '$($row.'Device Serial Number')': $($p -join '; ')" }
@@ -747,7 +942,7 @@ function Import-AutopilotToIntune {
         $serial = "$($row.'Device Serial Number')".Trim()
         $q = $serial -replace "'", "''"
         $existing = Invoke-MgGraphRequest -Method GET -Uri ($base + "/windowsAutopilotDeviceIdentities?`$filter=contains(serialNumber,'$q')")
-        if (@($existing.value).Count -gt 0) {
+        if (@($existing.value | Where-Object { $_.serialNumber -eq $serial }).Count -gt 0) {
             Write-ToolkitLog "$serial already registered in Autopilot - skipped." 'WARN'
             $results.Add([pscustomobject]@{ Serial = $serial; Result = 'AlreadyRegistered'; Detail = '' }); continue
         }
@@ -803,7 +998,7 @@ function Get-IntuneDeviceReport {
     $ap = Invoke-MgGraphRequest -Method GET -Uri ($base + "/windowsAutopilotDeviceIdentities?`$filter=contains(serialNumber,'$q')")
     $md = Invoke-MgGraphRequest -Method GET -Uri ($base + "/managedDevices?`$filter=serialNumber%20eq%20'$q'")
     $out = New-Object System.Collections.Generic.List[object]
-    foreach ($d in @($ap.value)) {
+    foreach ($d in @($ap.value | Where-Object { $_.serialNumber -eq $Serial })) {
         $out.Add([pscustomobject]@{ Source = 'Autopilot'; Serial = $d.serialNumber; Detail = "groupTag=$($d.groupTag); profile=$($d.deploymentProfileAssignmentStatus); lastContact=$($d.lastContactedDateTime)" })
     }
     foreach ($d in @($md.value)) {
@@ -814,13 +1009,308 @@ function Get-IntuneDeviceReport {
     $out.ToArray()
 }
 
+# ----------------------------------------------------------------------------- device snapshot (header chips in the GUI)
+
+function Get-DeviceSnapshot {
+    $t = Get-ToolkitTarget
+    $js = Get-JoinState
+    $cfg = Get-ToolkitConfig
+    $ws1 = @(Get-InstalledProgram -NamePattern $cfg.ws1Names).Count + @(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'WorkspaceONE' }).Count
+    $sc = Get-SccmClientStatus
+    [pscustomobject]@{
+        ComputerName = $t.ComputerName; Serial = $t.Serial; User = $t.User; MachineGuid = $t.MachineGuid
+        AdJoined = $js.DomainJoined; AdName = $js.DomainName; EntraJoined = $js.AzureAdJoined; Tenant = $js.TenantName
+        Intune = (@(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'Intune' }).Count -gt 0)
+        WorkspaceOne = ($ws1 -gt 0); Sccm = [bool]($sc.ServiceInstalled -or $sc.SetupPresent)
+    }
+}
+
+# ----------------------------------------------------------------------------- automated run (phases)
+# One click runs everything it can on this device, phase by phase. A phase ends where a restart or a new sign-in is
+# needed; progress is saved (runplan.json) so the next click continues with the next phase. Secrets (AD credential,
+# local admin password) live in memory for one run and are never written to disk. The saved plan is tied to this
+# device's MachineGuid and is ignored on any other device.
+
+$script:RunPath    = Join-Path $script:DataRoot 'runplan.json'
+$script:RunPathDry = Join-Path $script:DataRoot 'runplan.dryrun.json'
+$script:RunOutcome = $null
+
+function Get-RunPhaseInfo {
+    @(
+        [pscustomobject]@{ Phase = 1; Title = 'Prepare and leave the old environment'; Note = 'Checks, hardware hash, remove Workspace ONE and SCCM, leave Active Directory. Ends with a restart.' }
+        [pscustomobject]@{ Phase = 2; Title = 'Join Entra ID and enroll in Intune'; Note = 'After the restart, signed in with the local admin. Ends with signing in as the new user.' }
+        [pscustomobject]@{ Phase = 3; Title = 'Finish'; Note = 'Signed in as the new Entra user: move the profile, tidy up, remove the temporary admin.' }
+    )
+}
+
+function Resolve-RunOption {
+    param($Saved, [hashtable]$New = @{})
+    $o = @{
+        GroupTag = ''; OutputFolder = (Join-Path $script:ToolkitRoot 'Output\Autopilot')
+        CaptureHash = $true; UploadHash = $false; Offline = $false
+        Debloat = $true; LaunchProfwiz = $true; RemoveTempAdmin = $false
+    }
+    if ($Saved) { foreach ($k in @($o.Keys)) { if ($Saved.PSObject.Properties.Name -contains $k -and $null -ne $Saved.$k) { $o[$k] = $Saved.$k } } }
+    foreach ($k in @($o.Keys)) { if ($New.ContainsKey($k) -and $null -ne $New[$k]) { $o[$k] = $New[$k] } }
+    foreach ($k in 'AdCredential', 'AdminPassword') { if ($New.ContainsKey($k)) { $o[$k] = $New[$k] } }
+    $o
+}
+
+function Get-RunStepDefinition {
+    param([hashtable]$Options = @{})
+    $o = Resolve-RunOption -New $Options
+    $d = @(
+        @{ Phase = 1; Id = 'LocalAdmin';       Title = 'Temporary local admin (only if none exists)'; Optional = $false; Enabled = $true }
+        @{ Phase = 1; Id = 'Preflight';        Title = 'Pre-flight checks';                            Optional = $false; Enabled = $true }
+        @{ Phase = 1; Id = 'CaptureHash';      Title = 'Capture Autopilot hardware hash';              Optional = $true;  Enabled = [bool]$o.CaptureHash }
+        @{ Phase = 1; Id = 'UploadHash';       Title = 'Upload hash to Intune Autopilot';              Optional = $true;  Enabled = ([bool]$o.CaptureHash -and [bool]$o.UploadHash) }
+        @{ Phase = 1; Id = 'RemoveWS1';        Title = 'Remove Workspace ONE';                         Optional = $false; Enabled = $true }
+        @{ Phase = 1; Id = 'RemoveSCCM';       Title = 'Remove SCCM client';                           Optional = $false; Enabled = $true }
+        @{ Phase = 1; Id = 'UnjoinAD';         Title = 'Leave Active Directory';                       Optional = $false; Enabled = $true }
+        @{ Phase = 2; Id = 'JoinEntra';        Title = 'Join Entra ID';                                Optional = $false; Enabled = $true }
+        @{ Phase = 2; Id = 'VerifyIntune';     Title = 'Verify Intune enrollment and back up BitLocker key'; Optional = $false; Enabled = $true }
+        @{ Phase = 3; Id = 'ProfileWizard';    Title = 'Profile migration (Profile Wizard, finish by hand)'; Optional = $true; Enabled = [bool]$o.LaunchProfwiz }
+        @{ Phase = 3; Id = 'Debloat';          Title = 'Remove preinstalled apps';                     Optional = $true;  Enabled = [bool]$o.Debloat }
+        @{ Phase = 3; Id = 'RemoveTempAdmin';  Title = 'Remove temporary local admin';                 Optional = $true;  Enabled = [bool]$o.RemoveTempAdmin }
+    )
+    foreach ($s in $d) { [pscustomobject]$s }
+}
+
+function Get-RunPlanState {
+    param([switch]$Dry)
+    $path = $script:RunPath; if ($Dry) { $path = $script:RunPathDry }
+    if (Test-Path $path) { try { return (Get-Content $path -Raw | ConvertFrom-Json) } catch {} }
+    $null
+}
+
+function Clear-RunPlanState {
+    foreach ($p in @($script:RunPath, $script:RunPathDry)) { if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue } }
+    Write-ToolkitLog 'Saved automatic-run progress cleared.' 'OK'
+}
+
+function Save-RunPlan {
+    param([Parameter(Mandatory)][hashtable]$Plan)
+    $path = $script:RunPath; if ($script:DryRun) { $path = $script:RunPathDry }
+    $Plan.Updated = (Get-Date).ToString('s')
+    ConvertTo-Json -InputObject $Plan -Depth 6 | Set-Content -Path $path -Encoding UTF8
+}
+
+function Set-RunOutcome { param([string]$Status, [string]$Detail = '') $script:RunOutcome = @{ Status = $Status; Detail = $Detail } }
+
+function New-RunResult {
+    param([string]$Status, [int]$NextPhase, [bool]$RestartNeeded, [string]$Message)
+    [pscustomobject]@{ Status = $Status; NextPhase = $NextPhase; RestartNeeded = $RestartNeeded; Message = $Message }
+}
+
+# Turns the record a legacy step wrote into state.json into this run's outcome (and throws if it failed).
+function Resolve-StateOutcome {
+    param([Parameter(Mandatory)][string]$Key)
+    if ($script:DryRun) { Set-RunOutcome 'DryRun'; return }
+    $s = @(Get-StepState) | Where-Object { $_.Step -eq $Key } | Select-Object -First 1
+    if (-not $s) { throw 'The step finished without recording a result.' }
+    if ($s.Status -eq 'Failed') { if ($s.Detail) { throw $s.Detail } else { throw 'The step failed; see the log above.' } }
+    Set-RunOutcome $s.Status $s.Detail
+}
+
+function Test-RunPrerequisite {
+    param([int]$FromPhase, [hashtable]$Options)
+    if (-not (Test-IsAdmin)) { throw 'Run as administrator.' }
+    if ($FromPhase -le 1 -and $Options.CaptureHash) {
+        $e = Test-GroupTagName $Options.GroupTag
+        if ($e) { throw "Hardware hash capture is turned on but the group tag is not usable: $e" }
+    }
+    if ($FromPhase -le 1 -and -not $script:DryRun) {
+        if ((Get-JoinState).DomainJoined) {
+            $hasCred = [bool]($Options.AdCredential -and $Options.AdCredential.UserName)
+            if (-not $hasCred -and -not $Options.Offline) { throw 'This device is domain joined: supply AD credentials, or choose offline unjoin.' }
+            if (@(Get-LocalAdminCandidate).Count -eq 0 -and -not $Options.AdminPassword) { throw 'No enabled local administrator exists. Supply a password for a temporary local admin before leaving the domain.' }
+        }
+    }
+}
+
+function Invoke-RunStep {
+    param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][hashtable]$Options)
+    switch ($Id) {
+        'LocalAdmin' {
+            if (-not (Get-JoinState).DomainJoined) { Set-RunOutcome 'Skipped' 'Not domain joined, so there is no lock-out risk'; return }
+            if (@(Get-LocalAdminCandidate).Count -gt 0) { Set-RunOutcome 'Skipped' 'An enabled local admin already exists'; return }
+            $name = Get-ToolkitAdminName
+            if ($script:DryRun) { Write-ToolkitLog "DRY-RUN: would create local admin '$name'" 'WARN'; Set-RunOutcome 'DryRun'; return }
+            New-ToolkitLocalAdmin -Password $Options.AdminPassword
+            Set-RunOutcome 'Done' $name
+        }
+        'Preflight' {
+            $rep = @(Get-PreflightReport)
+            $domain = (Get-JoinState).DomainJoined
+            foreach ($c in $rep) {
+                $lvl = 'INFO'; if ($c.Status -eq 'Fail') { $lvl = 'ERROR' } elseif ($c.Status -eq 'Warn') { $lvl = 'WARN' }
+                Write-ToolkitLog ("{0,-5} {1}: {2}" -f $c.Status.ToUpper(), $c.Name, $c.Detail) $lvl
+            }
+            $blocking = @($rep | Where-Object { $_.Status -eq 'Fail' -and -not ($_.Name -eq 'Local administrator exists' -and (-not $domain -or $script:DryRun)) })
+            if ($blocking.Count -gt 0) { throw ('blocking problem(s): ' + (($blocking | ForEach-Object { $_.Name }) -join ', ')) }
+            Set-RunOutcome 'Done' ("{0} warning(s)" -f @($rep | Where-Object { $_.Status -eq 'Warn' }).Count)
+        }
+        'CaptureHash' {
+            $file = Invoke-AutopilotCapture -GroupTag $Options.GroupTag -OutputFolder $Options.OutputFolder
+            $st = 'Done'; if ($script:DryRun) { $st = 'DryRun' }
+            Set-RunOutcome $st ([string]$file)
+        }
+        'UploadHash' {
+            $file = Get-HashCsvPath -OutputFolder $Options.OutputFolder
+            if ($script:DryRun) { Write-ToolkitLog "DRY-RUN: would upload $file to Intune Autopilot" 'WARN'; Set-RunOutcome 'DryRun'; return }
+            if (-not (Test-Path $file)) { throw "Hardware hash file not found: $file" }
+            $res = @(Import-AutopilotToIntune -CsvPath $file)
+            foreach ($x in $res) { Write-ToolkitLog "RESULT $($x.Serial): $($x.Result) $($x.Detail)" }
+            $bad = @($res | Where-Object { $_.Result -notin 'complete', 'AlreadyRegistered' })
+            if ($bad.Count -gt 0) { throw "Autopilot upload did not complete: $(($bad | ForEach-Object { "$($_.Serial) $($_.Result)" }) -join '; ')" }
+            Set-RunOutcome 'Done' (($res | ForEach-Object { $_.Result }) -join ', ')
+        }
+        'RemoveWS1' {
+            $inv = Get-WorkspaceOneInventory
+            if ($inv.Programs.Count + $inv.Appx.Count + $inv.Enrollments.Count -eq 0) { Set-RunOutcome 'Skipped' 'Nothing found'; return }
+            Clear-StepState 'RemoveWS1'; Remove-WorkspaceOne; Resolve-StateOutcome 'RemoveWS1'
+        }
+        'RemoveSCCM' { Clear-StepState 'RemoveSCCM'; Remove-SccmClient; Resolve-StateOutcome 'RemoveSCCM' }
+        'UnjoinAD' {
+            Clear-StepState 'UnjoinAD'
+            $a = @{ OfflineUnjoin = [bool]$Options.Offline }
+            if ($Options.AdCredential) { $a.Credential = $Options.AdCredential }
+            Invoke-DomainUnjoin @a
+            $Options.AdCredential = $null
+            Resolve-StateOutcome 'UnjoinAD'
+        }
+        'JoinEntra' {
+            if ($script:DryRun -and (Get-JoinState).DomainJoined) { Write-ToolkitLog 'DRY-RUN: the device would already have left the domain at this point; Entra join not simulated.' 'WARN'; Set-RunOutcome 'DryRun'; return }
+            Clear-StepState 'JoinEntra'; Start-EntraJoin; Resolve-StateOutcome 'JoinEntra'
+        }
+        'VerifyIntune' {
+            if ($script:DryRun -and -not (Get-JoinState).AzureAdJoined) { Write-ToolkitLog 'DRY-RUN: the device is not Entra joined yet; Intune check not simulated.' 'WARN'; Set-RunOutcome 'DryRun'; return }
+            Clear-StepState 'VerifyIntune'; Complete-IntuneVerification; Resolve-StateOutcome 'VerifyIntune'
+        }
+        'ProfileWizard' {
+            $name = ''; try { $name = Get-ToolkitAdminName } catch {}
+            if ($name -and $env:USERNAME -ieq $name) { Write-ToolkitLog "You are signed in as the temporary admin '$name'. Profile Wizard should be run while signed in as the NEW Entra user (elevated)." 'WARN' }
+            Clear-StepState 'ProfileWizard'; Start-ProfileWizard; Resolve-StateOutcome 'ProfileWizard'
+        }
+        'Debloat' { Clear-StepState 'Cleanup'; Invoke-Debloat; Resolve-StateOutcome 'Cleanup' }
+        'RemoveTempAdmin' {
+            $name = Get-ToolkitAdminName
+            if (-not (Get-LocalUser -Name $name -ErrorAction SilentlyContinue)) { Set-RunOutcome 'Skipped' 'No such account'; return }
+            if (-not (Get-JoinState).AzureAdJoined) { Set-RunOutcome 'Skipped' 'Not Entra joined; keeping the admin so you are not locked out'; return }
+            if ($env:USERNAME -ieq $name) { Set-RunOutcome 'Skipped' 'Currently signed in as this account'; return }
+            Remove-ToolkitLocalAdmin
+            $st = 'Done'; if ($script:DryRun) { $st = 'DryRun' }
+            Set-RunOutcome $st $name
+        }
+        default { throw "Unknown run step '$Id'" }
+    }
+}
+
+function Invoke-MigrationRun {
+    param([int]$FromPhase = 0, [hashtable]$Options = @{})
+
+    $target = Get-ToolkitTarget
+    Write-ToolkitLog ("Automatic run on THIS device only: {0} (serial {1}), signed in as {2}" -f $target.ComputerName, $target.Serial, $target.User) 'STEP'
+
+    $saved = Get-RunPlanState -Dry:$script:DryRun
+    if ($saved -and $saved.Device.MachineGuid -and $target.MachineGuid -and $saved.Device.MachineGuid -ne $target.MachineGuid) {
+        Write-ToolkitLog 'A saved run plan belongs to a different device and is being ignored.' 'WARN'
+        $saved = $null
+    }
+    if ($saved -and $saved.Status -eq 'Completed') { $saved = $null }
+
+    $savedOptions = $null; if ($saved) { $savedOptions = $saved.Options }
+    $opt = Resolve-RunOption -Saved $savedOptions -New $Options
+    if ($FromPhase -le 0) { $FromPhase = 1; if ($saved) { $FromPhase = [int]$saved.Phase } }
+    if ($FromPhase -lt 1 -or $FromPhase -gt 3) { throw "Phase must be 1, 2 or 3." }
+    Test-RunPrerequisite -FromPhase $FromPhase -Options $opt
+
+    $defs = @(Get-RunStepDefinition -Options $opt)
+    $keep = @{}
+    if ($saved -and [int]$saved.Phase -eq $FromPhase) { foreach ($s in @($saved.Steps)) { $keep[$s.Id] = $s } }
+    $plan = @{
+        Version = 1; Created = (Get-Date).ToString('s'); Updated = ''; Phase = $FromPhase; Status = 'InProgress'; Message = ''
+        Device = @{ ComputerName = $target.ComputerName; Serial = $target.Serial; MachineGuid = $target.MachineGuid }
+        Options = @{ GroupTag = $opt.GroupTag; OutputFolder = $opt.OutputFolder; CaptureHash = [bool]$opt.CaptureHash; UploadHash = [bool]$opt.UploadHash
+                     Offline = [bool]$opt.Offline; Debloat = [bool]$opt.Debloat; LaunchProfwiz = [bool]$opt.LaunchProfwiz; RemoveTempAdmin = [bool]$opt.RemoveTempAdmin }
+        Steps = (New-Object System.Collections.ArrayList)
+    }
+    foreach ($d in $defs) {
+        $rec = @{ Id = $d.Id; Phase = $d.Phase; Status = 'Pending'; Detail = ''; Time = '' }
+        if ($d.Phase -lt $FromPhase) { $rec.Status = 'Skipped'; $rec.Detail = 'Earlier phase' }
+        elseif (-not $d.Enabled) { $rec.Status = 'Skipped'; $rec.Detail = 'Turned off' }
+        elseif ($keep.ContainsKey($d.Id) -and $keep[$d.Id].Status -in 'Done', 'Skipped') { $rec.Status = [string]$keep[$d.Id].Status; $rec.Detail = [string]$keep[$d.Id].Detail }
+        [void]$plan.Steps.Add($rec)
+    }
+    Save-RunPlan $plan
+    $phaseInfo = @(Get-RunPhaseInfo)
+
+    for ($ph = $FromPhase; $ph -le 3; $ph++) {
+        $plan.Phase = $ph; $plan.Status = 'InProgress'; Save-RunPlan $plan
+        Write-ToolkitLog ("PHASE {0} of 3: {1}" -f $ph, ($phaseInfo | Where-Object { $_.Phase -eq $ph }).Title) 'STEP'
+
+        foreach ($def in @($defs | Where-Object { $_.Phase -eq $ph })) {
+            $rec = @($plan.Steps | Where-Object { $_.Id -eq $def.Id })[0]
+            if ($rec.Status -ne 'Pending') { continue }
+            $rec.Status = 'Running'; $rec.Time = (Get-Date).ToString('s'); Save-RunPlan $plan
+            Write-ToolkitLog ("Phase {0}: {1}" -f $ph, $def.Title) 'STEP'
+            try {
+                $script:RunOutcome = $null
+                Invoke-RunStep -Id $def.Id -Options $opt | Out-Null
+                $out = $script:RunOutcome
+                if (-not $out) { $out = @{ Status = 'Done'; Detail = '' } }
+                $rec.Status = $out.Status; $rec.Detail = $out.Detail
+                $doneText = ("{0}: {1} {2}" -f $def.Title, $out.Status, $out.Detail).TrimEnd()
+                Write-ToolkitLog $doneText 'OK'
+            } catch {
+                $rec.Status = 'Failed'; $rec.Detail = $_.Exception.Message
+                Write-ToolkitLog ("{0} failed: {1}" -f $def.Title, $_.Exception.Message) 'ERROR'
+                if (-not $def.Optional) {
+                    $plan.Status = 'Failed'; $plan.Message = "$($def.Title): $($_.Exception.Message)"; Save-RunPlan $plan
+                    Write-ToolkitLog 'Run stopped. Fix the problem, then start again: finished steps are not repeated.' 'ERROR'
+                    return (New-RunResult 'Failed' $ph $false $plan.Message)
+                }
+                Write-ToolkitLog 'This step is optional, so the run continues.' 'WARN'
+            }
+            Save-RunPlan $plan
+        }
+
+        if ($ph -ge 3) { break }
+        $status = @{}; foreach ($r in $plan.Steps) { $status[$r.Id] = $r.Status }
+        if ($ph -eq 1) { $restart = ($status.UnjoinAD -eq 'Done' -or $status.RemoveWS1 -eq 'Done' -or $status.RemoveSCCM -eq 'Done') }
+        else { $restart = ($status.JoinEntra -eq 'Done') }
+        $plan.Phase = $ph + 1
+        if ($restart -and $script:DryRun) { Write-ToolkitLog 'DRY-RUN: a restart would be needed here; continuing the preview.' 'WARN' }
+        elseif ($restart) {
+            if ($ph -eq 1) { $msg = 'Phase 1 is complete. Restart the device, sign in (with the temporary local admin if the device left the domain) and continue with Phase 2.' }
+            else { $msg = 'Phase 2 is complete. Restart, then sign in as the NEW Entra user and continue with Phase 3.' }
+            $plan.Status = 'Paused'; $plan.Message = $msg; Save-RunPlan $plan
+            Write-ToolkitLog $msg 'OK'
+            return (New-RunResult 'Paused' ($ph + 1) $true $msg)
+        }
+    }
+    $plan.Status = 'Completed'; $plan.Phase = 3; $plan.Message = 'All phases finished.'; Save-RunPlan $plan
+    Write-ToolkitLog 'All phases finished on this device.' 'OK'
+    New-RunResult 'Completed' 3 $false $plan.Message
+}
+
 # ----------------------------------------------------------------------------- single dispatcher for GUI + CLI
+
+# Actions that change this device. They are refused in a remote session or when the toolkit runs from a network path.
+$script:LocalChangeAction = @('RemoveWS1', 'RemoveSCCM', 'CreateLocalAdmin', 'RemoveLocalAdmin', 'UnjoinAD', 'Restart', 'JoinEntra', 'VerifyIntune',
+    'IntuneSyncNow', 'BackupBitLocker', 'ProfileWizard', 'Debloat', 'RunMCPR', 'RunPhase')
 
 function Invoke-ToolkitAction {
     param([Parameter(Mandatory)][string]$Name, [hashtable]$Params = @{})
     Write-ToolkitLog "=== $Name ===" 'STEP'
     if ($script:DryRun) { Write-ToolkitLog 'DRY-RUN mode: no changes will be made.' 'WARN' }
     try {
+        if ($Name -in $script:LocalChangeAction) {
+            Assert-LocalScope
+            $t = Get-ToolkitTarget
+            if ($Params.ExpectSerial -and $t.Serial -ne $Params.ExpectSerial) { throw "Serial mismatch: this device is '$($t.Serial)' but '$($Params.ExpectSerial)' was expected. Nothing was changed." }
+            Write-ToolkitLog ("Scope: this device only - {0} (serial {1}), signed in as {2}" -f $t.ComputerName, $t.Serial, $t.User)
+        }
         switch ($Name) {
             'Preflight'        { $rep = Get-PreflightReport; foreach ($c in $rep) { Write-ToolkitLog ("{0,-5} {1}: {2}" -f $c.Status.ToUpper(), $c.Name, $c.Detail) $(if ($c.Status -eq 'Fail') { 'ERROR' } elseif ($c.Status -eq 'Warn') { 'WARN' } else { 'INFO' }) }; return $rep }
             'RemoveWS1'        { Remove-WorkspaceOne }
@@ -844,6 +1334,11 @@ function Invoke-ToolkitAction {
             'UploadAutopilot'  { $res = Import-AutopilotToIntune -CsvPath $Params.CsvPath; foreach ($x in $res) { Write-ToolkitLog "RESULT $($x.Serial): $($x.Result) $($x.Detail)" } }
             'AutopilotSync'    { Sync-AutopilotService }
             'DeviceLookup'     { [void](Get-IntuneDeviceReport -Serial $Params.Serial) }
+            'RunPhase'         { $ro = $Params.Options; if (-not $ro) { $ro = @{} }; return (Invoke-MigrationRun -FromPhase ([int]$Params.Phase) -Options $ro) }
+            'AddGroupTag'      { if ($script:DryRun) { Write-ToolkitLog "DRY-RUN: would save group tag '$($Params.GroupTag)'" 'WARN' } else { [void](Add-GroupTag -Name $Params.GroupTag) } }
+            'RemoveGroupTag'   { if ($script:DryRun) { Write-ToolkitLog "DRY-RUN: would remove group tag '$($Params.GroupTag)'" 'WARN' } else { Remove-GroupTag -Name $Params.GroupTag } }
+            'ListGroupTags'    { foreach ($t in (Get-GroupTagList)) { Write-ToolkitLog "  $t" } }
+            'DiscardRunPlan'   { Clear-RunPlanState }
             default            { throw "Unknown action '$Name'" }
         }
         Write-ToolkitLog "=== $Name finished ===" 'STEP'
@@ -855,4 +1350,7 @@ function Invoke-ToolkitAction {
 }
 
 Export-ModuleMember -Function Initialize-Toolkit, Set-ToolkitLogSink, Set-ToolkitDryRun, Get-ToolkitRoot, Get-ToolkitLogDir, Write-ToolkitLog,
-    Get-ToolkitConfig, Get-StepState, Test-IsAdmin, Invoke-ToolkitAction, Get-WorkspaceOneInventory
+    Get-ToolkitConfig, Get-StepState, Test-IsAdmin, Invoke-ToolkitAction, Get-WorkspaceOneInventory,
+    Get-ToolkitTarget, Get-DeviceSnapshot, Get-JoinState, Get-LocalAdminCandidate,
+    Get-GroupTagList, Test-GroupTagName, Add-GroupTag, Remove-GroupTag,
+    Get-RunPhaseInfo, Get-RunStepDefinition, Get-RunPlanState, Clear-RunPlanState
