@@ -24,9 +24,9 @@ The **Automatic run** page does everything it can in order. A phase ends where W
 
 | Phase | What it does | Ends with |
 |---|---|---|
-| **1. Prepare and leave the old environment** | Temporary local admin (only if none exists), pre-flight checks, hardware-hash capture (+ optional Autopilot upload), remove Workspace ONE, remove SCCM, leave Active Directory | Restart |
-| **2. Join Entra ID and enroll in Intune** | Entra join, verify Intune enrollment, BitLocker key escrow | Sign in as the new user |
-| **3. Finish** | Profile Wizard (you finish it by hand), remove preinstalled apps, optionally remove the temporary admin | Done |
+| **1. Prepare and leave the old environment** | Temporary local admin (only if none exists), pre-flight checks, a **data-at-risk check** (OneDrive Known Folder Move status, local-only files, PST files), **BitLocker recovery-key prep** (key created if missing, escrowed to AD), hardware-hash capture (+ optional Autopilot upload), remove Workspace ONE, remove SCCM, leave Active Directory | Restart |
+| **2. Join Entra ID and enroll in Intune** | **Confirms Workspace ONE is completely gone** (after the restart, so locked files are released), Entra join, verify Intune enrollment, BitLocker key escrow | Sign in as the new user |
+| **3. Finish** | Profile Wizard (you finish it by hand), remove preinstalled apps, optionally remove the temporary admin, **save a migration report** | Done |
 
 Behaviour that makes it safe to leave running:
 
@@ -35,6 +35,10 @@ Behaviour that makes it safe to leave running:
 - It confirms by asking you to type the computer name, and shows the name and serial in the header and in every log.
 - **Dry run** walks all three phases and changes nothing (it writes a separate preview plan file).
 - Credentials and the temporary-admin password are held in memory for that run only; the saved plan contains no secrets.
+
+## Workspace ONE: proof it is gone
+
+Removal is verified, not assumed. The check (Step by step > *Verify Workspace ONE is gone*, and automatically at the start of Phase 2) looks for: programs matched by name **or** publisher (so old AirWatch agents and rebranded Omnissa/VMware Hubs are caught, while VMware Tools is not), Store apps, MDM enrollments, services, running processes, scheduled tasks (including orphaned enrollment tasks), leftover folders and registry keys, device certificates, CA certificates, provisioning packages, orphaned installer records and per-user data folders. It removes what is safe to remove (services, processes, tasks, device certificates, vendor folders and keys) and lists the rest as items to check by hand. Phase 2 will not continue until nothing removable is left. The names it matches are in `Config\toolkit.json` (`ws1Names`, `ws1Publishers`, `ws1AppxNames`). It cannot see the Workspace ONE console: retire the device there too.
 
 ## Group tags
 

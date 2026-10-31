@@ -8,7 +8,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Gui', 'Preflight', 'CaptureHash', 'MergeCsv', 'RemoveWS1', 'RemoveSCCM', 'JoinEntra', 'VerifyIntune', 'Debloat', 'DeviceLookup',
-                 'RunPhase', 'AddGroupTag', 'RemoveGroupTag', 'ListGroupTags', 'DiscardRunPlan')]
+                 'RunPhase', 'AddGroupTag', 'RemoveGroupTag', 'ListGroupTags', 'DiscardRunPlan', 'DataAtRisk', 'VerifyWS1Removed', 'BitLockerPrep', 'MigrationReport')]
     [string]$Action = 'Gui',
     [string]$GroupTag = '',
     [string]$Folder = '',
@@ -678,7 +678,9 @@ foreach ($ph in @(Get-RunPhaseInfo)) {
 $stepsPage = New-Page 'Steps'
 Add-Heading $stepsPage.Table 'Step by step' 'Run one step at a time, in order. Every step re-checks the device, so it is safe to repeat. Each change applies to this computer only.'
 Add-ActionRow $stepsPage.Table '1. Pre-flight checks' 'Read-only. Admin rights, local session, network, power, TPM, BitLocker, local admin, and the current WS1 / AD / Entra / Intune state.' @{ Name = 'Preflight' } 'Check'
+Add-ActionRow $stepsPage.Table 'Check for data at risk' 'Read-only. Per profile: what is backed up to OneDrive (Known Folder Move) and what exists only on this disk, plus local PST files and folder redirection.' @{ Name = 'DataAtRisk' } 'Check'
 Add-ActionRow $stepsPage.Table '2. Remove Workspace ONE' 'Uninstalls Hub / AirWatch agents, unenrolls through Windows, removes leftover tasks and registry, then verifies.' @{ Name = 'RemoveWS1'; Confirm = "Remove all of the above?`n`nTell the device's user first: apps, Wi-Fi, VPN, certificates and policies pushed by WS1 may disappear, and removal can take several minutes (do not power off).`n`nAlso retire the device in the WS1 console afterwards." } 'Remove'
+Add-ActionRow $stepsPage.Table 'Verify Workspace ONE is gone' 'Deep check for programs (any version or publisher), Store apps, enrollments, services, tasks, folders, registry, certificates and packages. Removes what it safely can, lists the rest.' @{ Name = 'VerifyWS1Removed' } 'Verify'
 Add-ActionRow $stepsPage.Table '3. Remove SCCM client' 'Runs ccmsetup /uninstall and waits until the client is really gone.' @{ Name = 'RemoveSCCM'; Confirm = 'Uninstall the SCCM (ConfigMgr) client?' } 'Remove'
 Add-ActionRow $stepsPage.Table '4. Unjoin Active Directory' 'Refuses to run unless an enabled local admin exists. Handles hybrid join, then offers a restart. Create a local admin first if needed (Maintenance).' @{ Name = 'UnjoinAD'; Needs = 'Credential'; Confirm = "Remove this computer from Active Directory?`n`nDomain sign-in stops working after the restart. Make sure you know a LOCAL admin password and have the BitLocker recovery key recorded." } 'Unjoin'
 Add-ActionRow $stepsPage.Table '5. Join Entra ID' 'Opens Settings (or installs a .ppkg from Tools\) and waits until dsregcmd confirms the join. Sign in with the user''s work account.' @{ Name = 'JoinEntra' } 'Join'
@@ -735,6 +737,8 @@ Add-ActionRow $mt.Table 'Create temporary local admin' 'Creates / re-enables the
 Add-ActionRow $mt.Table 'Remove temporary local admin' 'Deletes that account once migration is finished.' @{ Name = 'RemoveLocalAdmin'; Confirm = 'Delete the temporary local admin account?' } 'Remove'
 Add-Heading $mt.Table 'Intune / Entra helpers'
 Add-ActionRow $mt.Table 'Force Intune enrollment' 'Runs deviceenroller /AutoEnrollMDM if the device is Entra joined but not yet enrolled.' @{ Name = 'IntuneSyncNow' } 'Enroll'
+Add-ActionRow $mt.Table 'Prepare BitLocker recovery key' 'Makes sure a recovery password exists and escrows it to Active Directory while the device is still joined. The key is never logged or saved to disk.' @{ Name = 'BitLockerPrep' } 'Prepare'
+Add-ActionRow $mt.Table 'Save migration report' 'Writes a plain-text summary (join state, Intune, Workspace ONE leftovers, BitLocker, step results) to Output\Reports.' @{ Name = 'MigrationReport' } 'Save'
 Add-ActionRow $mt.Table 'Back up BitLocker key to Entra' 'Escrows the OS-drive recovery password to Entra ID.' @{ Name = 'BackupBitLocker' } 'Back up'
 Add-ActionRow $mt.Table 'Install Graph module' 'Installs Microsoft.Graph.Authentication for the current user from PSGallery (needed for Intune upload).' @{ Name = 'InstallGraph'; Confirm = 'Download and install Microsoft.Graph.Authentication from the PowerShell Gallery?' } 'Install'
 Add-Heading $mt.Table 'Tools and power'
@@ -760,7 +764,7 @@ function New-ListCard {
 $sl = New-ListCard 230 @(@('Step', 230), @('Status', 90), @('When', 150), @('Detail', 380))
 $script:StepList = $sl.List
 Add-ToTable $st.Table $sl.Card
-Add-Heading $st.Table 'Pre-flight results' 'Run "Pre-flight checks" from Step by step to fill this in.'
+Add-Heading $st.Table 'Check results' 'Filled in by Pre-flight, Data at risk and Verify Workspace ONE.'
 $cl = New-ListCard 360 @(@('Result', 70), @('Check', 230), @('Detail', 560))
 $script:CheckList = $cl.List
 Add-ToTable $st.Table $cl.Card
@@ -1062,7 +1066,7 @@ function Complete-UiJob {
     Update-StepList
     Update-AutoView
     if ($tag.Name -notin 'Preflight', 'DeviceLookup', 'Restart', 'CancelRestart') { Update-DeviceCard }
-    if ($tag.Name -eq 'Preflight' -and $results) { Update-CheckList $results; Show-Page 'Status' }
+    if ($tag.Name -in 'Preflight', 'DataAtRisk', 'VerifyWS1Removed' -and $results) { Update-CheckList $results; Show-Page 'Status' }
     if ($tag.Name -eq 'RunPhase') {
         $res = @($results) | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'RestartNeeded' } | Select-Object -Last 1
         if ($res) {

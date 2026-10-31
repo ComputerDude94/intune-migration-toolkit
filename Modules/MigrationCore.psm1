@@ -42,9 +42,10 @@ function Get-ToolkitConfig {
         groupTags     = @('AutoPilot-Shared-Student Use', 'AutoPilot-Shared-FacStaff', 'AutoPilot-Individual-FacStaff', 'AutoPilot-Individual-Student Use')
         localAdminName = 'MigAdmin'
         workgroupName = 'WORKGROUP'
-        ws1Names      = @('*Workspace ONE*', '*AirWatch*')
+        ws1Names      = @('*Workspace ONE*', '*AirWatch*', '*Intelligent Hub*')
+        ws1Publishers = @('AirWatch*')
         ws1AppxNames  = @('*WorkspaceONE*', '*Workspace ONE*', '*AirWatch*')
-        ws1CleanupPaths = @('HKLM:\SOFTWARE\AirWatch', 'HKLM:\SOFTWARE\WOW6432Node\AirWatch', "$env:ProgramData\AirWatch", "$env:ProgramData\VMware\SetupAssistant")
+        ws1CleanupPaths = @('HKLM:\SOFTWARE\AirWatch', 'HKLM:\SOFTWARE\WOW6432Node\AirWatch', "$env:ProgramData\AirWatch", "$env:ProgramData\VMware\SetupAssistant", "$env:ProgramFiles\AirWatch", "${env:ProgramFiles(x86)}\AirWatch")
         debloat       = @('Microsoft.Todos', 'Microsoft.BingWeather', 'Microsoft.ZuneVideo', 'MicrosoftTeams', 'Microsoft.ZuneMusic', 'Microsoft.YourPhone',
                           'Microsoft.MicrosoftOfficeHub', 'Microsoft.GamingApp', 'E0469640.SmartAppearance', 'E046963F.LenovoCompanion',
                           'McAfeeWPSSparsePackage', 'Microsoft.Xbox.TCUI', 'Microsoft.XboxGameOverlay', 'Microsoft.XboxGamingOverlay',
@@ -269,11 +270,24 @@ function Get-InstalledProgram {
         foreach ($pat in $NamePattern) {
             if ($name -like $pat) {
                 $out.Add([pscustomobject]@{
-                    DisplayName = $name; Version = $item.DisplayVersion; KeyName = $item.PSChildName
+                    DisplayName = $name; Publisher = $item.Publisher; Version = $item.DisplayVersion; KeyName = $item.PSChildName
                     UninstallString = $item.UninstallString; QuietUninstallString = $item.QuietUninstallString })
                 break
             }
         }
+    }
+    $out.ToArray()
+}
+
+# Matches by product name OR publisher, so older AirWatch agents and rebranded Hub builds are both found.
+function Get-WorkspaceOneProgram {
+    $cfg = Get-ToolkitConfig
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($p in @(Get-InstalledProgram -NamePattern '*')) {
+        $hit = $false
+        foreach ($n in $cfg.ws1Names) { if ($p.DisplayName -like $n) { $hit = $true; break } }
+        if (-not $hit -and $p.Publisher) { foreach ($pub in $cfg.ws1Publishers) { if ($p.Publisher -like $pub) { $hit = $true; break } } }
+        if ($hit) { $out.Add($p) }
     }
     $out.ToArray()
 }
@@ -407,7 +421,7 @@ function Get-PreflightReport {
     $r.Add((New-Check 'Active Directory' 'Info' $(if ($js.DomainJoined) { "Joined to $($js.DomainName)" } else { 'Not domain joined' })))
     $r.Add((New-Check 'Entra ID' 'Info' $(if ($js.AzureAdJoined) { "Joined (tenant: $($js.TenantName))" } else { 'Not Entra joined' })))
 
-    $hub = @(Get-InstalledProgram -NamePattern $cfg.ws1Names)
+    $hub = @(Get-WorkspaceOneProgram)
     $enr = @(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'WorkspaceONE' })
     $r.Add((New-Check 'Workspace ONE' 'Info' ("Programs: {0}; MDM enrollments: {1}" -f $hub.Count, $enr.Count)))
     $sc = Get-SccmClientStatus
@@ -480,10 +494,102 @@ function Get-WorkspaceOneAppx {
 function Get-WorkspaceOneInventory {
     $cfg = Get-ToolkitConfig
     [pscustomobject]@{
-        Programs    = @(Get-InstalledProgram -NamePattern $cfg.ws1Names)
+        Programs    = @(Get-WorkspaceOneProgram)
         Appx        = @(Get-WorkspaceOneAppx)
         Enrollments = @(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'WorkspaceONE' })
     }
+}
+
+# Everything Workspace ONE / AirWatch can leave behind. Fix = 'auto' (the toolkit removes it) or 'manual' (reported only).
+function Get-WorkspaceOneResidue {
+    $cfg = Get-ToolkitConfig
+    $out = New-Object System.Collections.Generic.List[object]
+    $add = { param($Cat, $Item, $Detail, $Fix) $out.Add([pscustomobject]@{ Category = $Cat; Item = $Item; Detail = $Detail; Fix = $Fix }) }
+
+    foreach ($x in @(Get-WorkspaceOneProgram)) { & $add 'Program' $x.DisplayName "$($x.Version) ($($x.Publisher))" 'auto' }
+    foreach ($x in @(Get-WorkspaceOneAppx)) { & $add 'Store app' $x.Name $x.PackageFullName 'auto' }
+    foreach ($x in @(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'WorkspaceONE' })) { & $add 'MDM enrollment' $x.Id $x.ProviderId 'auto' }
+
+    try {
+        foreach ($sv in @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.Name -match 'AirWatch|AWService|Workspace ?ONE' -or $_.DisplayName -match 'AirWatch|Workspace ONE' -or $_.PathName -match 'AirWatch|Workspace ?ONE' })) {
+            & $add 'Service' $sv.Name "$($sv.State); $($sv.PathName)" 'auto'
+        }
+    } catch {}
+    try {
+        foreach ($pr in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -match 'AirWatch|Workspace ?ONE' })) { & $add 'Process' "$($pr.ProcessName) ($($pr.Id))" $pr.Path 'auto' }
+    } catch {}
+    try {
+        $liveIds = @(Get-MdmEnrollment | ForEach-Object { $_.Id })
+        foreach ($tk in @(Get-ScheduledTask -ErrorAction Stop)) {
+            $orphan = ($tk.TaskPath -match 'EnterpriseMgmt\\([0-9A-Fa-f-]{36})\\' -and $liveIds -notcontains $Matches[1])
+            if ($orphan -or $tk.TaskPath -match 'AirWatch|Workspace ?ONE' -or $tk.TaskName -match 'AirWatch|Workspace ?ONE') { & $add 'Scheduled task' "$($tk.TaskPath)$($tk.TaskName)" '' 'auto' }
+        }
+    } catch {}
+    foreach ($raw in $cfg.ws1CleanupPaths) {
+        if (-not (Test-SafeCleanupPath $raw)) { continue }
+        $path = [Environment]::ExpandEnvironmentVariables($raw)
+        if (Test-Path $path) { & $add $(if ($raw -like 'HKLM:*') { 'Registry key' } else { 'Folder' }) $path '' 'auto' }
+    }
+    try {
+        foreach ($c in @(Get-ChildItem Cert:\LocalMachine\My -ErrorAction Stop | Where-Object { $_.Issuer -match 'AirWatch|Workspace ONE' -or $_.Subject -match 'AirWatch' })) { & $add 'Device certificate' $c.Thumbprint $c.Subject 'auto' }
+        foreach ($c in @(Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA -ErrorAction Stop | Where-Object { $_.Subject -match 'AirWatch|Workspace ONE' })) { & $add 'CA certificate' $c.Thumbprint $c.Subject 'manual' }
+    } catch {}
+    try {
+        foreach ($pk in @(Get-ProvisioningPackage -AllInstalledPackages -ErrorAction Stop | Where-Object { $_.PackageName -match 'AirWatch|Workspace|WS1' })) { & $add 'Provisioning package' $pk.PackageName $pk.PackageId 'manual' }
+    } catch {}
+    try {
+        foreach ($k in @(Get-ChildItem 'HKLM:\SOFTWARE\Classes\Installer\Products' -ErrorAction Stop)) {
+            $pn = (Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue).ProductName
+            if ($pn -match 'AirWatch|Workspace ONE') { & $add 'Orphan installer record' $pn $k.PSChildName 'manual' }
+        }
+    } catch {}
+    try {
+        foreach ($d in @(Get-ChildItem "$env:SystemDrive\Users" -Directory -ErrorAction Stop)) {
+            foreach ($sub in 'AppData\Local\AirWatch', 'AppData\Roaming\AirWatch') { $pp = Join-Path $d.FullName $sub; if (Test-Path $pp) { & $add 'User data folder' $pp '' 'manual' } }
+        }
+    } catch {}
+    $out.ToArray()
+}
+
+# Removes the residue the toolkit can safely remove (services, processes, tasks, device certificates).
+function Remove-WorkspaceOneResidue {
+    foreach ($r in @(Get-WorkspaceOneResidue)) {
+        switch ($r.Category) {
+            'Process' { $id = [int](($r.Item -replace '^.*\((\d+)\)$', '$1')); Invoke-Mutation "stop process $($r.Item)" { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } | Out-Null }
+            'Service' { $nm = $r.Item; Invoke-Mutation "stop and delete service $nm" { Stop-Service -Name $nm -Force -ErrorAction SilentlyContinue; & sc.exe delete $nm | Out-Null } | Out-Null }
+            'Scheduled task' {
+                $full = $r.Item
+                Invoke-Mutation "remove scheduled task $full" {
+                    $tp = $full.Substring(0, $full.LastIndexOf('\') + 1); $tn = $full.Substring($full.LastIndexOf('\') + 1)
+                    Unregister-ScheduledTask -TaskPath $tp -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+                } | Out-Null
+            }
+            'Device certificate' { $th = $r.Item; Invoke-Mutation "remove device certificate $th from LocalMachine\My" { Remove-Item "Cert:\LocalMachine\My\$th" -Force -ErrorAction SilentlyContinue } | Out-Null }
+        }
+    }
+}
+
+# The "is it really gone" check. Returns check rows for the GUI; -Clean first removes what the toolkit can.
+function Test-WorkspaceOneRemoval {
+    param([switch]$Clean)
+    if ($Clean) { Remove-WorkspaceOneResidue }
+    $res = @(Get-WorkspaceOneResidue)
+    $auto = @($res | Where-Object { $_.Fix -eq 'auto' })
+    $manual = @($res | Where-Object { $_.Fix -eq 'manual' })
+    $rows = New-Object System.Collections.Generic.List[object]
+    if ($res.Count -eq 0) {
+        Write-ToolkitLog 'Workspace ONE is completely gone: no programs, Store apps, enrollments, services, tasks, folders, registry keys or certificates found.' 'OK'
+        $rows.Add((New-Check 'Workspace ONE removal' 'Pass' 'Nothing left on this device'))
+    } else {
+        $verdict = 'Warn'; if ($auto.Count -gt 0) { $verdict = 'Fail' }
+        $rows.Add((New-Check 'Workspace ONE removal' $verdict ("{0} item(s) still present ({1} removable by the toolkit, {2} to check by hand). A restart may release locked items." -f $res.Count, $auto.Count, $manual.Count)))
+        foreach ($r in $res) {
+            $lvl = 'ERROR'; $st = 'Fail'; if ($r.Fix -eq 'manual') { $lvl = 'WARN'; $st = 'Warn' }
+            Write-ToolkitLog ("Left behind - {0}: {1} {2}" -f $r.Category, $r.Item, $r.Detail) $lvl
+            $rows.Add((New-Check $r.Category $st ("$($r.Item) $($r.Detail)").Trim()))
+        }
+    }
+    $rows.ToArray()
 }
 
 # Asks Windows itself to unenroll (mdmregistration.dll). Returns the HRESULT, or -1 if the call could not be made.
@@ -502,7 +608,7 @@ function Invoke-MdmUnenroll {
 
 function Remove-WorkspaceOne {
     $cfg = Get-ToolkitConfig
-    $programs = @(Get-InstalledProgram -NamePattern $cfg.ws1Names)
+    $programs = @(Get-WorkspaceOneProgram)
     if ($programs.Count -eq 0) { Write-ToolkitLog 'No Workspace ONE / AirWatch programs found.' }
     foreach ($p in $programs) {
         Write-ToolkitLog "Uninstalling $($p.DisplayName) $($p.Version)" 'STEP'
@@ -552,8 +658,10 @@ function Remove-WorkspaceOne {
         if (Test-Path $path) { Invoke-Mutation "remove leftover $path" { Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue } | Out-Null }
     }
 
+    Remove-WorkspaceOneResidue
+
     if (-not $script:DryRun) {
-        $left = @(Get-InstalledProgram -NamePattern $cfg.ws1Names)
+        $left = @(Get-WorkspaceOneProgram)
         $leftEnr = @(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'WorkspaceONE' })
         $leftAppx = @(Get-WorkspaceOneAppx)
         $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*AirWatch*' -or $_.DisplayName -like '*Workspace ONE*' })
@@ -1009,13 +1117,113 @@ function Get-IntuneDeviceReport {
     $out.ToArray()
 }
 
+# ----------------------------------------------------------------------------- data at risk / OneDrive / BitLocker prep
+
+function Get-FolderSize {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return 0 }
+    [long](Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+}
+
+function Format-Size { param([long]$Bytes) if ($Bytes -ge 1GB) { '{0:N1} GB' -f ($Bytes / 1GB) } elseif ($Bytes -ge 1MB) { '{0:N0} MB' -f ($Bytes / 1MB) } else { '{0:N0} KB' -f ($Bytes / 1KB) } }
+
+# Read-only. Shows, per local profile, what exists only on this disk (not in OneDrive) so nothing is lost by a wipe or a bad profile move.
+function Get-DataAtRiskReport {
+    $rows = New-Object System.Collections.Generic.List[object]
+    $risk = $false
+    $profiles = @()
+    try { $profiles = @(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object { -not $_.Special -and $_.LocalPath -like "$env:SystemDrive\Users\*" }) } catch {}
+    if ($profiles.Count -eq 0) { $rows.Add((New-Check 'Local profiles' 'Info' 'No user profiles found')) }
+    foreach ($pr in $profiles) {
+        $path = $pr.LocalPath; $name = Split-Path $path -Leaf
+        Write-ToolkitLog "Scanning profile $name (Desktop, Documents, Pictures, Downloads, Outlook)..."
+        $od = @(Get-ChildItem -LiteralPath $path -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue)
+        $local = 0L; $kfm = New-Object System.Collections.Generic.List[string]; $notKfm = New-Object System.Collections.Generic.List[string]
+        foreach ($f in 'Desktop', 'Documents', 'Pictures') {
+            $inCloud = ($od | Where-Object { Test-Path (Join-Path $_.FullName $f) }).Count -gt 0
+            $size = Get-FolderSize (Join-Path $path $f)
+            if ($inCloud -and $size -eq 0) { $kfm.Add($f) } else { $notKfm.Add($f); $local += $size }
+        }
+        $downloads = Get-FolderSize (Join-Path $path 'Downloads')
+        $pst = @(Get-ChildItem -LiteralPath $path -Recurse -Force -File -Include '*.pst', '*.ost' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\OneDrive' })
+        $pstPst = @($pst | Where-Object { $_.Extension -ieq '.pst' })
+        $detail = "OneDrive-backed: {0}; local only: {1} ({2}); Downloads {3}" -f $(if ($kfm.Count) { $kfm -join ', ' } else { 'none' }), $(if ($notKfm.Count) { $notKfm -join ', ' } else { 'none' }), (Format-Size $local), (Format-Size $downloads)
+        $status = 'Pass'
+        if ($local -gt 0 -or $pstPst.Count -gt 0) { $status = 'Warn'; $risk = $true }
+        $rows.Add((New-Check "Profile $name" $status $detail))
+        foreach ($f in $pstPst) { $rows.Add((New-Check "  PST file ($name)" 'Warn' ("{0} ({1}) is local only - copy it somewhere safe" -f $f.FullName, (Format-Size $f.Length)))) }
+    }
+    $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive' -ErrorAction SilentlyContinue
+    if ($pol -and ($pol.KFMSilentOptIn -or $pol.KFMOptInWithWizard)) { $rows.Add((New-Check 'OneDrive Known Folder Move policy' 'Pass' 'Configured on this device')) }
+    else { $rows.Add((New-Check 'OneDrive Known Folder Move policy' 'Info' 'No KFM policy found. Turn it on in Intune before cutover so Desktop, Documents and Pictures are backed up.')) }
+    $acct = Get-ItemProperty 'HKCU:\Software\Microsoft\OneDrive\Accounts\Business1' -ErrorAction SilentlyContinue
+    if ($acct -and $acct.UserEmail) { $rows.Add((New-Check 'OneDrive (signed-in user)' 'Info' "Signed in as $($acct.UserEmail)")) }
+    $ush = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction SilentlyContinue
+    if ($ush -and (@($ush.PSObject.Properties | Where-Object { "$($_.Value)" -like '\\*' }).Count -gt 0)) { $rows.Add((New-Check 'Folder redirection' 'Warn' 'The signed-in user has folders redirected to a network share; that data is not on this disk.')) ; $risk = $true }
+    $summary = if ($risk) { New-Check 'Data at risk' 'Warn' 'Some data exists only on this disk. Back it up (OneDrive Known Folder Move, USMT or a copy) before continuing.' } else { New-Check 'Data at risk' 'Pass' 'Nothing found that exists only on this disk' }
+    foreach ($r in (@($summary) + $rows.ToArray())) {
+        $lvl = 'INFO'; if ($r.Status -eq 'Warn') { $lvl = 'WARN' }
+        Write-ToolkitLog ("{0,-5} {1}: {2}" -f $r.Status.ToUpper(), $r.Name, $r.Detail) $lvl
+    }
+    @($summary) + $rows.ToArray()
+}
+
+# Makes sure a BitLocker recovery key exists before the device changes management, and escrows it to AD while still domain joined.
+# (The Entra copy is made in the Intune step.) The key itself is never logged or written to disk.
+function Initialize-BitLockerKey {
+    try { $v = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop } catch { Write-ToolkitLog 'BitLocker is not available on this device; nothing to prepare.'; return 'Not available' }
+    if ($v.ProtectionStatus -ne 'On' -and "$($v.VolumeStatus)" -notmatch 'Encrypted') { Write-ToolkitLog 'OS drive is not encrypted; nothing to prepare.'; return 'Not encrypted' }
+    $kps = @($v.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+    if ($kps.Count -eq 0) {
+        Invoke-Mutation 'add a BitLocker recovery password protector' { Add-BitLockerKeyProtector -MountPoint $env:SystemDrive -RecoveryPasswordProtector | Out-Null } | Out-Null
+        if (-not $script:DryRun) { $kps = @((Get-BitLockerVolume -MountPoint $env:SystemDrive).KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' }) }
+    }
+    if (-not $script:DryRun -and $kps.Count -eq 0) { throw 'The OS drive is encrypted but no recovery password could be created.' }
+    if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
+        foreach ($kp in $kps) {
+            Invoke-Mutation "escrow BitLocker protector $($kp.KeyProtectorId) to Active Directory" {
+                try { Backup-BitLockerKeyProtector -MountPoint $env:SystemDrive -KeyProtectorId $kp.KeyProtectorId | Out-Null } catch { Write-ToolkitLog "  AD escrow skipped: $($_.Exception.Message)" 'WARN' }
+            } | Out-Null
+        }
+    }
+    Write-ToolkitLog ("BitLocker: {0} recovery password protector(s) present. The key will be backed up to Entra ID after the join." -f $kps.Count) 'OK'
+    "$($kps.Count) recovery protector(s)"
+}
+
+# ----------------------------------------------------------------------------- migration report
+
+function New-MigrationReport {
+    $t = Get-ToolkitTarget; $js = Get-JoinState
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("Migration report - $($t.ComputerName)"); $lines.Add("Generated: $((Get-Date).ToString('s'))"); $lines.Add("Serial: $($t.Serial)"); $lines.Add("Signed in as: $($t.User)"); $lines.Add('')
+    $lines.Add("Active Directory joined : $($js.DomainJoined) $($js.DomainName)")
+    $lines.Add("Entra ID joined         : $($js.AzureAdJoined) $($js.TenantName)")
+    $lines.Add("Intune enrolled         : $(@(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'Intune' }).Count -gt 0)")
+    $res = @(Get-WorkspaceOneResidue)
+    $left = 'none (clean)'
+    if ($res.Count -gt 0) { $left = "$($res.Count) item(s): " + ((@($res | ForEach-Object { $_.Category }) | Sort-Object -Unique) -join ', ') }
+    $lines.Add("Workspace ONE leftovers : $left")
+    $lines.Add("SCCM client present     : $((Get-SccmClientStatus).ServiceInstalled)")
+    try { $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop; $lines.Add("BitLocker               : protection $($bl.ProtectionStatus), recovery passwords $(@($bl.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' }).Count)") } catch { $lines.Add('BitLocker               : not available') }
+    $lines.Add(''); $lines.Add('Step results:')
+    foreach ($st in @(Get-StepState)) { $lines.Add(("  {0,-14} {1,-8} {2}  {3}" -f $st.Step, $st.Status, $st.Time, $st.Detail)) }
+    $dir = Join-Path $script:ToolkitRoot 'Output\Reports'
+    $file = Join-Path $dir ("{0}_{1}.txt" -f ($t.Serial -replace '[^\w-]', '_'), (Get-Date -Format 'yyyyMMdd-HHmm'))
+    Invoke-Mutation "write migration report to $file" {
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Set-Content -Path $file -Value $lines -Encoding UTF8
+    } | Out-Null
+    if (-not $script:DryRun) { Write-ToolkitLog "Migration report saved: $file" 'OK' }
+    $file
+}
+
 # ----------------------------------------------------------------------------- device snapshot (header chips in the GUI)
 
 function Get-DeviceSnapshot {
     $t = Get-ToolkitTarget
     $js = Get-JoinState
     $cfg = Get-ToolkitConfig
-    $ws1 = @(Get-InstalledProgram -NamePattern $cfg.ws1Names).Count + @(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'WorkspaceONE' }).Count
+    $ws1 = @(Get-WorkspaceOneProgram).Count + @(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'WorkspaceONE' }).Count
     $sc = Get-SccmClientStatus
     [pscustomobject]@{
         ComputerName = $t.ComputerName; Serial = $t.Serial; User = $t.User; MachineGuid = $t.MachineGuid
@@ -1062,16 +1270,20 @@ function Get-RunStepDefinition {
     $d = @(
         @{ Phase = 1; Id = 'LocalAdmin';       Title = 'Temporary local admin (only if none exists)'; Optional = $false; Enabled = $true }
         @{ Phase = 1; Id = 'Preflight';        Title = 'Pre-flight checks';                            Optional = $false; Enabled = $true }
+        @{ Phase = 1; Id = 'DataCheck';        Title = 'Check for data that exists only on this disk';  Optional = $true;  Enabled = $true }
+        @{ Phase = 1; Id = 'BitLockerPrep';    Title = 'Make sure a BitLocker recovery key exists';     Optional = $false; Enabled = $true }
         @{ Phase = 1; Id = 'CaptureHash';      Title = 'Capture Autopilot hardware hash';              Optional = $true;  Enabled = [bool]$o.CaptureHash }
         @{ Phase = 1; Id = 'UploadHash';       Title = 'Upload hash to Intune Autopilot';              Optional = $true;  Enabled = ([bool]$o.CaptureHash -and [bool]$o.UploadHash) }
         @{ Phase = 1; Id = 'RemoveWS1';        Title = 'Remove Workspace ONE';                         Optional = $false; Enabled = $true }
         @{ Phase = 1; Id = 'RemoveSCCM';       Title = 'Remove SCCM client';                           Optional = $false; Enabled = $true }
         @{ Phase = 1; Id = 'UnjoinAD';         Title = 'Leave Active Directory';                       Optional = $false; Enabled = $true }
+        @{ Phase = 2; Id = 'VerifyWS1Gone';    Title = 'Confirm Workspace ONE is completely gone';      Optional = $false; Enabled = $true }
         @{ Phase = 2; Id = 'JoinEntra';        Title = 'Join Entra ID';                                Optional = $false; Enabled = $true }
         @{ Phase = 2; Id = 'VerifyIntune';     Title = 'Verify Intune enrollment and back up BitLocker key'; Optional = $false; Enabled = $true }
         @{ Phase = 3; Id = 'ProfileWizard';    Title = 'Profile migration (Profile Wizard, finish by hand)'; Optional = $true; Enabled = [bool]$o.LaunchProfwiz }
         @{ Phase = 3; Id = 'Debloat';          Title = 'Remove preinstalled apps';                     Optional = $true;  Enabled = [bool]$o.Debloat }
         @{ Phase = 3; Id = 'RemoveTempAdmin';  Title = 'Remove temporary local admin';                 Optional = $true;  Enabled = [bool]$o.RemoveTempAdmin }
+        @{ Phase = 3; Id = 'Report';           Title = 'Save a migration report';                       Optional = $true;  Enabled = $true }
     )
     foreach ($s in $d) { [pscustomobject]$s }
 }
@@ -1150,6 +1362,24 @@ function Invoke-RunStep {
             if ($blocking.Count -gt 0) { throw ('blocking problem(s): ' + (($blocking | ForEach-Object { $_.Name }) -join ', ')) }
             Set-RunOutcome 'Done' ("{0} warning(s)" -f @($rep | Where-Object { $_.Status -eq 'Warn' }).Count)
         }
+        'DataCheck' {
+            $rep = @(Get-DataAtRiskReport)
+            $w = @($rep | Where-Object { $_.Status -eq 'Warn' }).Count
+            Set-RunOutcome 'Done' $(if ($w) { "$w item(s) need attention - see the log" } else { 'Nothing at risk' })
+        }
+        'BitLockerPrep' { $d = Initialize-BitLockerKey; $st = 'Done'; if ($script:DryRun) { $st = 'DryRun' }; Set-RunOutcome $st ([string]$d) }
+        'VerifyWS1Gone' {
+            $rows = @(Test-WorkspaceOneRemoval -Clean:(-not $script:DryRun))
+            $bad = @($rows | Where-Object { $_.Status -eq 'Fail' -and $_.Name -ne 'Workspace ONE removal' })
+            if ($script:DryRun) { Set-RunOutcome 'DryRun'; return }
+            if ($bad.Count -gt 0) {
+                $kinds = (@($bad | ForEach-Object { $_.Name }) | Sort-Object -Unique) -join ', '
+                throw "Workspace ONE is not fully removed ($kinds). Restart and run again, or remove the items by hand."
+            }
+            $m = @($rows | Where-Object { $_.Status -eq 'Warn' }).Count
+            Set-RunOutcome 'Done' $(if ($m) { "clean, $m item(s) to check by hand" } else { 'completely clean' })
+        }
+        'Report' { $f = New-MigrationReport; $st = 'Done'; if ($script:DryRun) { $st = 'DryRun' }; Set-RunOutcome $st ([string]$f) }
         'CaptureHash' {
             $file = Invoke-AutopilotCapture -GroupTag $Options.GroupTag -OutputFolder $Options.OutputFolder
             $st = 'Done'; if ($script:DryRun) { $st = 'DryRun' }
@@ -1298,7 +1528,7 @@ function Invoke-MigrationRun {
 
 # Actions that change this device. They are refused in a remote session or when the toolkit runs from a network path.
 $script:LocalChangeAction = @('RemoveWS1', 'RemoveSCCM', 'CreateLocalAdmin', 'RemoveLocalAdmin', 'UnjoinAD', 'Restart', 'JoinEntra', 'VerifyIntune',
-    'IntuneSyncNow', 'BackupBitLocker', 'ProfileWizard', 'Debloat', 'RunMCPR', 'RunPhase')
+    'IntuneSyncNow', 'BackupBitLocker', 'BitLockerPrep', 'ProfileWizard', 'Debloat', 'RunMCPR', 'RunPhase')
 
 function Invoke-ToolkitAction {
     param([Parameter(Mandatory)][string]$Name, [hashtable]$Params = @{})
@@ -1334,6 +1564,10 @@ function Invoke-ToolkitAction {
             'UploadAutopilot'  { $res = Import-AutopilotToIntune -CsvPath $Params.CsvPath; foreach ($x in $res) { Write-ToolkitLog "RESULT $($x.Serial): $($x.Result) $($x.Detail)" } }
             'AutopilotSync'    { Sync-AutopilotService }
             'DeviceLookup'     { [void](Get-IntuneDeviceReport -Serial $Params.Serial) }
+            'DataAtRisk'       { return (Get-DataAtRiskReport) }
+            'VerifyWS1Removed' { return (Test-WorkspaceOneRemoval -Clean:(-not $script:DryRun)) }
+            'BitLockerPrep'    { [void](Initialize-BitLockerKey) }
+            'MigrationReport'  { [void](New-MigrationReport) }
             'RunPhase'         { $ro = $Params.Options; if (-not $ro) { $ro = @{} }; return (Invoke-MigrationRun -FromPhase ([int]$Params.Phase) -Options $ro) }
             'AddGroupTag'      { if ($script:DryRun) { Write-ToolkitLog "DRY-RUN: would save group tag '$($Params.GroupTag)'" 'WARN' } else { [void](Add-GroupTag -Name $Params.GroupTag) } }
             'RemoveGroupTag'   { if ($script:DryRun) { Write-ToolkitLog "DRY-RUN: would remove group tag '$($Params.GroupTag)'" 'WARN' } else { Remove-GroupTag -Name $Params.GroupTag } }
@@ -1351,6 +1585,6 @@ function Invoke-ToolkitAction {
 
 Export-ModuleMember -Function Initialize-Toolkit, Set-ToolkitLogSink, Set-ToolkitDryRun, Get-ToolkitRoot, Get-ToolkitLogDir, Write-ToolkitLog,
     Get-ToolkitConfig, Get-StepState, Test-IsAdmin, Invoke-ToolkitAction, Get-WorkspaceOneInventory,
-    Get-ToolkitTarget, Get-DeviceSnapshot, Get-JoinState, Get-LocalAdminCandidate,
+    Get-ToolkitTarget, Get-DeviceSnapshot, Get-WorkspaceOneResidue, Get-JoinState, Get-LocalAdminCandidate,
     Get-GroupTagList, Test-GroupTagName, Add-GroupTag, Remove-GroupTag,
     Get-RunPhaseInfo, Get-RunStepDefinition, Get-RunPlanState, Clear-RunPlanState

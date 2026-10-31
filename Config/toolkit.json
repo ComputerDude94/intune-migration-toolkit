@@ -10,7 +10,11 @@
   "workgroupName": "WORKGROUP",
   "ws1Names": [
     "*Workspace ONE*",
-    "*AirWatch*"
+    "*AirWatch*",
+    "*Intelligent Hub*"
+  ],
+  "ws1Publishers": [
+    "AirWatch*"
   ],
   "ws1AppxNames": [
     "*WorkspaceONE*",
@@ -20,7 +24,9 @@
   "ws1CleanupPaths": [
     "HKLM:\\SOFTWARE\\AirWatch",
     "HKLM:\\SOFTWARE\\WOW6432Node\\AirWatch",
-    "%ProgramData%\\AirWatch"
+    "%ProgramData%\\AirWatch",
+    "%ProgramFiles%\\AirWatch",
+    "%ProgramFiles(x86)%\\AirWatch"
   ],
   "debloat": [
     "Microsoft.Todos",
