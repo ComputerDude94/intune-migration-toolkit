@@ -1,0 +1,41 @@
+{
+  "_note": "Edit freely. Keys starting with _ are ignored. Anything omitted falls back to the built-in default.",
+  "groupTags": [
+    "AutoPilot-Shared-Student Use",
+    "AutoPilot-Shared-FacStaff",
+    "AutoPilot-Individual-FacStaff",
+    "AutoPilot-Individual-Student Use"
+  ],
+  "localAdminName": "MigAdmin",
+  "workgroupName": "WORKGROUP",
+  "ws1Names": [
+    "Workspace ONE Intelligent Hub*",
+    "VMware Workspace ONE Intelligent Hub*",
+    "AirWatch*",
+    "VMware AirWatch*",
+    "Workspace ONE*"
+  ],
+  "ws1CleanupPaths": [
+    "HKLM:\\SOFTWARE\\AirWatch",
+    "HKLM:\\SOFTWARE\\WOW6432Node\\AirWatch",
+    "%ProgramData%\\AirWatch"
+  ],
+  "debloat": [
+    "Microsoft.Todos",
+    "Microsoft.BingWeather",
+    "Microsoft.ZuneVideo",
+    "MicrosoftTeams",
+    "Microsoft.ZuneMusic",
+    "Microsoft.YourPhone",
+    "Microsoft.MicrosoftOfficeHub",
+    "Microsoft.GamingApp",
+    "E0469640.SmartAppearance",
+    "E046963F.LenovoCompanion",
+    "McAfeeWPSSparsePackage",
+    "Microsoft.Xbox.TCUI",
+    "Microsoft.XboxGameOverlay",
+    "Microsoft.XboxGamingOverlay",
+    "LenovoSettingsforEnterprise",
+    "E0469649.SmartAppearance"
+  ]
+}

@@ -1,0 +1,6 @@
+# Autopilot hardware hashes identify real devices
+Output/*
+!Output/.gitkeep
+# Vendor binaries are copied in by hand
+Tools/*
+!Tools/README.txt
