@@ -42,7 +42,8 @@ function Get-ToolkitConfig {
         groupTags     = @('AutoPilot-Shared-Student Use', 'AutoPilot-Shared-FacStaff', 'AutoPilot-Individual-FacStaff', 'AutoPilot-Individual-Student Use')
         localAdminName = 'MigAdmin'
         workgroupName = 'WORKGROUP'
-        ws1Names      = @('Workspace ONE Intelligent Hub*', 'VMware Workspace ONE Intelligent Hub*', 'AirWatch*', 'VMware AirWatch*', 'Workspace ONE*')
+        ws1Names      = @('*Workspace ONE*', '*AirWatch*')
+        ws1AppxNames  = @('*WorkspaceONE*', '*Workspace ONE*', '*AirWatch*')
         ws1CleanupPaths = @('HKLM:\SOFTWARE\AirWatch', 'HKLM:\SOFTWARE\WOW6432Node\AirWatch', "$env:ProgramData\AirWatch", "$env:ProgramData\VMware\SetupAssistant")
         debloat       = @('Microsoft.Todos', 'Microsoft.BingWeather', 'Microsoft.ZuneVideo', 'MicrosoftTeams', 'Microsoft.ZuneMusic', 'Microsoft.YourPhone',
                           'Microsoft.MicrosoftOfficeHub', 'Microsoft.GamingApp', 'E0469640.SmartAppearance', 'E046963F.LenovoCompanion',
@@ -106,9 +107,13 @@ function Start-LoggedProcess {
     if ($ArgumentText) { $splat.ArgumentList = $ArgumentText }
     $p = Start-Process @splat
     $null = $p.Handle   # keeps ExitCode readable after exit
-    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-        try { $p.Kill() } catch {}
-        throw "Timed out after $TimeoutSec s: $FilePath $ArgumentText"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while (-not $p.WaitForExit(15000)) {
+        if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) {
+            try { $p.Kill() } catch {}
+            throw "Timed out after $TimeoutSec s: $FilePath $ArgumentText"
+        }
+        Write-ToolkitLog ("  still running ({0}s)..." -f [int]$sw.Elapsed.TotalSeconds)
     }
     $p.ExitCode
 }
@@ -296,6 +301,42 @@ function Remove-MdmEnrollmentArtifact {
     }
 }
 
+function Get-WorkspaceOneAppx {
+    $cfg = Get-ToolkitConfig
+    $out = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($pkg in (Get-AppxPackage -AllUsers -ErrorAction Stop)) {
+            foreach ($pat in $cfg.ws1AppxNames) {
+                if ($pkg.Name -like $pat -or $pkg.PackageFamilyName -like $pat) { $out.Add($pkg); break }
+            }
+        }
+    } catch { Write-ToolkitLog "Could not enumerate Store apps: $($_.Exception.Message)" 'WARN' }
+    $out.ToArray()
+}
+
+function Get-WorkspaceOneInventory {
+    $cfg = Get-ToolkitConfig
+    [pscustomobject]@{
+        Programs    = @(Get-InstalledProgram -NamePattern $cfg.ws1Names)
+        Appx        = @(Get-WorkspaceOneAppx)
+        Enrollments = @(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'WorkspaceONE' })
+    }
+}
+
+# Asks Windows itself to unenroll (mdmregistration.dll). Returns the HRESULT, or -1 if the call could not be made.
+function Invoke-MdmUnenroll {
+    param([Parameter(Mandatory)][string]$EnrollmentId)
+    try {
+        if (-not ('Toolkit.MdmNative' -as [type])) {
+            Add-Type -Namespace Toolkit -Name MdmNative -MemberDefinition '[System.Runtime.InteropServices.DllImport("mdmregistration.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] public static extern int UnregisterDeviceWithManagement(string enrollmentID);'
+        }
+        [Toolkit.MdmNative]::UnregisterDeviceWithManagement($EnrollmentId)
+    } catch {
+        Write-ToolkitLog "UnregisterDeviceWithManagement could not be called: $($_.Exception.Message)" 'WARN'
+        -1
+    }
+}
+
 function Remove-WorkspaceOne {
     $cfg = Get-ToolkitConfig
     $programs = @(Get-InstalledProgram -NamePattern $cfg.ws1Names)
@@ -320,10 +361,26 @@ function Remove-WorkspaceOne {
         }
     }
 
+    foreach ($pkg in @(Get-WorkspaceOneAppx)) {
+        Write-ToolkitLog "Removing Store app $($pkg.Name)" 'STEP'
+        Invoke-Mutation "remove app package $($pkg.PackageFullName) for all users" {
+            try { Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop } catch { Write-ToolkitLog "  $($_.Exception.Message)" 'WARN' }
+        } | Out-Null
+    }
+
     $enrollments = @(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'WorkspaceONE' })
     foreach ($e in $enrollments) {
-        Write-ToolkitLog "Removing leftover Workspace ONE MDM enrollment $($e.Id)" 'STEP'
-        Remove-MdmEnrollmentArtifact -EnrollmentId $e.Id
+        Write-ToolkitLog "Unenrolling Workspace ONE MDM enrollment $($e.Id) through Windows" 'STEP'
+        $hr = Invoke-Mutation "call UnregisterDeviceWithManagement for $($e.Id)" { Invoke-MdmUnenroll -EnrollmentId $e.Id }
+        if ($null -ne $hr) {
+            Write-ToolkitLog ("  UnregisterDeviceWithManagement returned 0x{0:X8}" -f [int]$hr)
+            Start-Sleep -Seconds 5
+        }
+        $still = @(Get-MdmEnrollment | Where-Object { $_.Id -eq $e.Id })
+        if ($script:DryRun -or $still.Count -gt 0) {
+            if (-not $script:DryRun) { Write-ToolkitLog 'Enrollment still present; falling back to registry cleanup (policies pushed by WS1 may linger).' 'WARN' }
+            Remove-MdmEnrollmentArtifact -EnrollmentId $e.Id
+        }
     }
 
     foreach ($rawPath in $cfg.ws1CleanupPaths) {
@@ -334,13 +391,14 @@ function Remove-WorkspaceOne {
     if (-not $script:DryRun) {
         $left = @(Get-InstalledProgram -NamePattern $cfg.ws1Names)
         $leftEnr = @(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'WorkspaceONE' })
+        $leftAppx = @(Get-WorkspaceOneAppx)
         $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*AirWatch*' -or $_.DisplayName -like '*Workspace ONE*' })
-        if ($left.Count -eq 0 -and $leftEnr.Count -eq 0) {
-            Write-ToolkitLog 'Workspace ONE removal verified (no programs, no MDM enrollment).' 'OK'
+        if ($left.Count -eq 0 -and $leftEnr.Count -eq 0 -and $leftAppx.Count -eq 0) {
+            Write-ToolkitLog 'Workspace ONE removal verified (no programs, Store apps or MDM enrollment). A restart is recommended before the next step.' 'OK'
             if ($svc.Count) { Write-ToolkitLog ("Services still registered until reboot: " + (($svc | ForEach-Object { $_.DisplayName }) -join ', ')) 'WARN' }
             Set-StepState 'RemoveWS1' 'Done'
         } else {
-            Write-ToolkitLog "Workspace ONE removal incomplete: $($left.Count) program(s), $($leftEnr.Count) enrollment(s) remain." 'ERROR'
+            Write-ToolkitLog "Workspace ONE removal incomplete: $($left.Count) program(s), $($leftAppx.Count) Store app(s), $($leftEnr.Count) enrollment(s) remain." 'ERROR'
             Set-StepState 'RemoveWS1' 'Failed' 'Leftovers remain'
         }
     }
@@ -797,4 +855,4 @@ function Invoke-ToolkitAction {
 }
 
 Export-ModuleMember -Function Initialize-Toolkit, Set-ToolkitLogSink, Set-ToolkitDryRun, Get-ToolkitRoot, Get-ToolkitLogDir, Write-ToolkitLog,
-    Get-ToolkitConfig, Get-StepState, Test-IsAdmin, Invoke-ToolkitAction
+    Get-ToolkitConfig, Get-StepState, Test-IsAdmin, Invoke-ToolkitAction, Get-WorkspaceOneInventory

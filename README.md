@@ -54,6 +54,6 @@ Written and statically reviewed on a Mac. **It has not been run on Windows.** On
 Not independently verifiable from here:
 
 - **Graph upload**: endpoints, the `groupTag` field on `importedWindowsAutopilotDeviceIdentity`, and the Graph beta API are from memory of the public docs. Confirm with one device first.
-- **WS1 leftover cleanup**: the registry / task list is the community-standard MDM-enrollment cleanup, not a VMware-documented procedure. Retire the device in the WS1 console as well.
+- **WS1 unenroll**: the tool first asks Windows to unenroll (`UnregisterDeviceWithManagement` in `mdmregistration.dll`) and only falls back to deleting registry keys and tasks (community practice, not a VMware procedure, and policies pushed by WS1 can linger). The unenroll call has not been tested against a real WS1 enrollment. Name matching (`*Workspace ONE*`, `*AirWatch*`, plus Store-app packages) is a best guess for newer, rebranded Hub builds. Retire the device in the WS1 console as well.
 - **Profwiz**: the freeware edition is GUI only, so that step launches it; you finish the wizard by hand.
 - **Silent Entra join** via `.ppkg` and the `ms-settings:workplace` flow depend on your tenant settings (join permissions, MDM user scope, Intune licence).

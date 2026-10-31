@@ -166,6 +166,18 @@ function Start-UiAction {
     param([hashtable]$Tag)
     if ($script:Busy) { Show-Message 'Another action is still running.' | Out-Null; return }
     $dry = $script:DryBox.Checked
+    if ($Tag.Name -eq 'RemoveWS1') {
+        $inv = Get-WorkspaceOneInventory
+        if ($inv.Programs.Count + $inv.Appx.Count + $inv.Enrollments.Count -eq 0) {
+            Show-Message 'No Workspace ONE programs, Store apps or MDM enrollments were found on this device.' | Out-Null
+            return
+        }
+        $found = New-Object System.Collections.Generic.List[string]
+        foreach ($x in $inv.Programs) { $found.Add("  Program: $($x.DisplayName) $($x.Version)") }
+        foreach ($x in $inv.Appx) { $found.Add("  Store app: $($x.Name)") }
+        foreach ($x in $inv.Enrollments) { $found.Add("  MDM enrollment: $($x.Id) ($($x.ProviderId))") }
+        $Tag = @{ Name = $Tag.Name; Confirm = "Found on this device:`n$($found -join "`n")`n`n$($Tag.Confirm)" }
+    }
     if ($Tag.Confirm -and -not $dry) {
         $r = Show-Message $Tag.Confirm 'Confirm' 'YesNo' 'Warning'
         if ($r -ne 'Yes') { return }
@@ -201,6 +213,13 @@ function Complete-UiJob {
     Set-UiBusy $false
     Update-StepList
     if ($tag.Name -eq 'Preflight' -and $results) { Update-CheckList $results; $script:Tabs.SelectedTab = $script:TabStatus }
+    if ($tag.Name -eq 'RemoveWS1' -and -not $script:DryBox.Checked) {
+        $s = @(Get-StepState) | Where-Object { $_.Step -eq 'RemoveWS1' } | Select-Object -First 1
+        if ($s -and $s.Status -eq 'Done') {
+            $r = Show-Message "Workspace ONE removal was verified. A restart is recommended before the next step.`n`nRestart in 60 seconds?" 'Restart recommended' 'YesNo' 'Question'
+            if ($r -eq 'Yes') { Start-UiAction @{ Name = 'Restart'; Needs = 'Restart' } }
+        }
+    }
     if ($tag.Name -eq 'UnjoinAD' -and -not $script:DryBox.Checked) {
         $s = @(Get-StepState) | Where-Object { $_.Step -eq 'UnjoinAD' } | Select-Object -First 1
         if ($s -and $s.Status -eq 'Done') {
@@ -258,7 +277,7 @@ $script:Tabs.Dock = 'Fill'
 $mig = New-TabFlow 'Migration'
 Add-Heading $mig.Flow 'Run in order. Each step re-checks the machine, so it is safe to repeat.'
 Add-Row $mig.Flow '1. Pre-flight checks' 'Read-only. Admin rights, network, power, TPM, BitLocker, local admin, current WS1 / AD / Entra / Intune state.' @{ Name = 'Preflight' }
-Add-Row $mig.Flow '2. Remove Workspace ONE' 'Uninstalls Hub / AirWatch agents, removes the leftover MDM enrollment, scheduled tasks and registry, then verifies.' @{ Name = 'RemoveWS1'; Confirm = "Remove Workspace ONE from this device?`n`nTo avoid orphaned records, also retire the device in the WS1 console. Apps and policies pushed by WS1 may be removed." }
+Add-Row $mig.Flow '2. Remove Workspace ONE' 'Uninstalls Hub / AirWatch agents, removes the leftover MDM enrollment, scheduled tasks and registry, then verifies.' @{ Name = 'RemoveWS1'; Confirm = "Remove all of the above?`n`nTell the device's user first: apps, Wi-Fi, VPN, certificates and policies pushed by WS1 may disappear, and removal can take several minutes (do not power off).`n`nAlso retire the device in the WS1 console afterwards." }
 Add-Row $mig.Flow '3. Remove SCCM client' 'Runs ccmsetup /uninstall and waits until the client is really gone.' @{ Name = 'RemoveSCCM'; Confirm = 'Uninstall the SCCM (ConfigMgr) client?' }
 Add-Row $mig.Flow '4. Unjoin Active Directory' 'Refuses to run unless an enabled local admin exists. Handles hybrid join, then offers a restart. Create a local admin first if needed (Maintenance tab).' @{ Name = 'UnjoinAD'; Needs = 'Credential'; Confirm = "Remove this computer from Active Directory?`n`nDomain sign-in stops working after the restart. Make sure you know a LOCAL admin password and have the BitLocker recovery key recorded." }
 Add-Row $mig.Flow '5. Join Entra ID' 'Opens Settings (or installs a .ppkg from Tools\) and waits until dsregcmd confirms the join. Sign in with the user''s work account.' @{ Name = 'JoinEntra' }

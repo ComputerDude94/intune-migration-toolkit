@@ -9,11 +9,13 @@
   "localAdminName": "MigAdmin",
   "workgroupName": "WORKGROUP",
   "ws1Names": [
-    "Workspace ONE Intelligent Hub*",
-    "VMware Workspace ONE Intelligent Hub*",
-    "AirWatch*",
-    "VMware AirWatch*",
-    "Workspace ONE*"
+    "*Workspace ONE*",
+    "*AirWatch*"
+  ],
+  "ws1AppxNames": [
+    "*WorkspaceONE*",
+    "*Workspace ONE*",
+    "*AirWatch*"
   ],
   "ws1CleanupPaths": [
     "HKLM:\\SOFTWARE\\AirWatch",
