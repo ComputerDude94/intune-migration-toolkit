@@ -1276,6 +1276,40 @@ function Get-RunPhaseInfo {
     )
 }
 
+# ---- time estimates: built-in guesses, replaced by the median of this device's own past runs once there are some.
+$script:TimingPath = Join-Path $script:DataRoot 'timings.json'
+
+function Get-StepEstimate {
+    $est = @{
+        LocalAdmin = 10; Preflight = 30; DataCheck = 90; BitLockerPrep = 20; CaptureHash = 15; UploadHash = 180; RemoveWS1 = 300; RemoveSCCM = 180
+        UnjoinAD = 45; VerifyWS1Gone = 30; JoinEntra = 180; VerifyIntune = 120; ProfileWizard = 600; Debloat = 90; RemoveTempAdmin = 10; Report = 10
+    }
+    if (Test-Path $script:TimingPath) {
+        try {
+            $hist = Get-Content $script:TimingPath -Raw | ConvertFrom-Json
+            foreach ($prop in $hist.PSObject.Properties) {
+                $v = @($prop.Value | Where-Object { $_ -gt 0 } | Sort-Object)
+                if ($v.Count -gt 0) { $est[$prop.Name] = [int]$v[[int][math]::Floor(($v.Count - 1) / 2)] }
+            }
+        } catch {}
+    }
+    $est
+}
+
+function Save-StepTiming {
+    param([string]$Id, [int]$Seconds)
+    if ($script:DryRun -or $Seconds -le 0) { return }
+    $hist = @{}
+    if (Test-Path $script:TimingPath) {
+        try { foreach ($prop in (Get-Content $script:TimingPath -Raw | ConvertFrom-Json).PSObject.Properties) { $hist[$prop.Name] = @($prop.Value) } } catch {}
+    }
+    $list = @(); if ($hist.ContainsKey($Id)) { $list = @($hist[$Id]) }
+    $hist[$Id] = @(($list + $Seconds) | Select-Object -Last 9)
+    try { ConvertTo-Json -InputObject $hist -Depth 3 | Set-Content -Path $script:TimingPath -Encoding UTF8 } catch {}
+}
+
+function Format-Duration { param([double]$Seconds) $t = [timespan]::FromSeconds([math]::Max(0, $Seconds)); if ($t.TotalHours -ge 1) { '{0}:{1:00}:{2:00}' -f [int]$t.TotalHours, $t.Minutes, $t.Seconds } else { '{0}:{1:00}' -f [int]$t.TotalMinutes, $t.Seconds } }
+
 function Resolve-RunOption {
     param($Saved, [hashtable]$New = @{})
     $o = @{
@@ -1491,7 +1525,7 @@ function Invoke-MigrationRun {
         Steps = (New-Object System.Collections.ArrayList)
     }
     foreach ($d in $defs) {
-        $rec = @{ Id = $d.Id; Phase = $d.Phase; Status = 'Pending'; Detail = ''; Time = '' }
+        $rec = @{ Id = $d.Id; Phase = $d.Phase; Status = 'Pending'; Detail = ''; Time = ''; Seconds = 0 }
         if ($d.Phase -lt $FromPhase) { $rec.Status = 'Skipped'; $rec.Detail = 'Earlier phase' }
         elseif (-not $d.Enabled) { $rec.Status = 'Skipped'; $rec.Detail = 'Turned off' }
         elseif ($keep.ContainsKey($d.Id) -and $keep[$d.Id].Status -in 'Done', 'Skipped') { $rec.Status = [string]$keep[$d.Id].Status; $rec.Detail = [string]$keep[$d.Id].Detail }
@@ -1508,6 +1542,7 @@ function Invoke-MigrationRun {
             $rec = @($plan.Steps | Where-Object { $_.Id -eq $def.Id })[0]
             if ($rec.Status -ne 'Pending') { continue }
             $rec.Status = 'Running'; $rec.Time = (Get-Date).ToString('s'); Save-RunPlan $plan
+            $stepClock = [Diagnostics.Stopwatch]::StartNew()
             Write-ToolkitLog ("Phase {0}: {1}" -f $ph, $def.Title) 'STEP'
             try {
                 $script:RunOutcome = $null
@@ -1515,10 +1550,12 @@ function Invoke-MigrationRun {
                 $out = $script:RunOutcome
                 if (-not $out) { $out = @{ Status = 'Done'; Detail = '' } }
                 $rec.Status = $out.Status; $rec.Detail = $out.Detail
-                $doneText = ("{0}: {1} {2}" -f $def.Title, $out.Status, $out.Detail).TrimEnd()
+                $rec.Seconds = [int]$stepClock.Elapsed.TotalSeconds
+                if ($out.Status -eq 'Done') { Save-StepTiming -Id $def.Id -Seconds $rec.Seconds }
+                $doneText = ("{0}: {1} {2} (took {3})" -f $def.Title, $out.Status, $out.Detail, (Format-Duration $stepClock.Elapsed.TotalSeconds)).TrimEnd()
                 Write-ToolkitLog $doneText 'OK'
             } catch {
-                $rec.Status = 'Failed'; $rec.Detail = $_.Exception.Message
+                $rec.Status = 'Failed'; $rec.Detail = $_.Exception.Message; $rec.Seconds = [int]$stepClock.Elapsed.TotalSeconds
                 Write-ToolkitLog ("{0} failed: {1}" -f $def.Title, $_.Exception.Message) 'ERROR'
                 if (-not $def.Optional) {
                     $plan.Status = 'Failed'; $plan.Message = "$($def.Title): $($_.Exception.Message)"; Save-RunPlan $plan
@@ -1612,4 +1649,4 @@ Export-ModuleMember -Function Initialize-Toolkit, Set-ToolkitLogSink, Set-Toolki
     Get-ToolkitConfig, Get-StepState, Test-IsAdmin, Invoke-ToolkitAction, Get-WorkspaceOneInventory,
     Get-ToolkitTarget, Get-DeviceSnapshot, Get-WorkspaceOneResidue, Get-JoinState, Get-LocalAdminCandidate,
     Get-GroupTagList, Test-GroupTagName, Add-GroupTag, Remove-GroupTag,
-    Request-ToolkitStop, Get-RunPhaseInfo, Get-RunStepDefinition, Get-RunPlanState, Clear-RunPlanState
+    Request-ToolkitStop, Get-StepEstimate, Format-Duration, Get-RunPhaseInfo, Get-RunStepDefinition, Get-RunPlanState, Clear-RunPlanState

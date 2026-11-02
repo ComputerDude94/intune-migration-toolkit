@@ -272,6 +272,9 @@ $script:JobTag   = $null
 $script:Busy     = $false
 $script:Snap     = $null
 $script:Tick     = 0
+$script:JobStart = $null
+$script:Est      = Get-StepEstimate
+$script:EstKey   = @{ DataAtRisk = 'DataCheck'; VerifyWS1Removed = 'VerifyWS1Gone'; UploadAutopilot = 'UploadHash' }
 $script:SyncingTag = $false
 $script:ActionButtons = New-Object System.Collections.Generic.List[object]
 $script:TagBoxes = New-Object System.Collections.Generic.List[object]
@@ -593,10 +596,10 @@ if ($script:UiKit) { $logCard.Edge = $Pal.LogBg }
 $script:LogBox = New-Object System.Windows.Forms.RichTextBox
 $script:LogBox.Dock = 'Fill'; $script:LogBox.ReadOnly = $true; $script:LogBox.BackColor = $Pal.LogBg; $script:LogBox.ForeColor = $Pal.LogInk
 $script:LogBox.Font = $Fnt.Mono; $script:LogBox.BorderStyle = 'None'
-$logHead = New-Label 'ACTIVITY' $Fnt.Small $Pal.NavMuted $Pal.LogBg; $logHead.Dock = 'Top'; $logHead.Height = 26; $logHead.TextAlign = 'MiddleLeft'
+$script:LogHead = New-Label 'ACTIVITY' $Fnt.Small $Pal.NavMuted $Pal.LogBg; $script:LogHead.Dock = 'Top'; $script:LogHead.Height = 26; $script:LogHead.TextAlign = 'MiddleLeft'
 $script:Progress = New-Object System.Windows.Forms.ProgressBar
 $script:Progress.Dock = 'Top'; $script:Progress.Height = 4; $script:Progress.MarqueeAnimationSpeed = 30
-$logCard.Controls.Add($script:LogBox); $logCard.Controls.Add($logHead); $logCard.Controls.Add($script:Progress)
+$logCard.Controls.Add($script:LogBox); $logCard.Controls.Add($script:LogHead); $logCard.Controls.Add($script:Progress)
 $logWrap.Controls.Add($logCard)
 
 # ---- page: automatic run -------------------------------------------------------
@@ -881,6 +884,8 @@ function Update-AutoView {
     $plan = Get-OwnPlan
     $recs = @{}
     if ($plan) { foreach ($r in @($plan.Steps)) { $recs[$r.Id] = $r } }
+    $curPhase = 1; if ($plan -and $plan.Status -ne 'Completed') { $curPhase = [int]$plan.Phase }
+    $remain = 0; $spent = 0
     foreach ($d in @(Get-RunStepDefinition -Options $o)) {
         $row = $script:StepRows[$d.Id]
         if (-not $row) { continue }
@@ -896,6 +901,20 @@ function Update-AutoView {
             'Off'     { $g = 0x2013; $col = $Pal.Muted }
             default   { $g = 0x25CB; $col = $Pal.Muted }
         }
+        $estSec = 0; if ($script:Est.ContainsKey($d.Id)) { $estSec = $script:Est[$d.Id] }
+        $estText = ''; if ($estSec) { $estText = Format-Duration $estSec }
+        $took = 0; $since = 0
+        if ($recs.ContainsKey($d.Id)) { $took = [int]$recs[$d.Id].Seconds; if ($status -eq 'Running' -and $recs[$d.Id].Time) { try { $since = ((Get-Date) - [datetime]$recs[$d.Id].Time).TotalSeconds } catch {} } }
+        switch ($status) {
+            'Pending' { if ($estText) { $detail = "about $estText" } }
+            'Running' { $detail = "running $(Format-Duration $since)"; if ($estText) { $detail += " of about $estText" } }
+            { $_ -in 'Done', 'DryRun' } { if ($took -gt 0) { $detail = ("took $(Format-Duration $took)  " + $detail).Trim() } }
+        }
+        if ($d.Phase -eq $curPhase -and $d.Enabled) {
+            if ($status -eq 'Pending') { $remain += $estSec }
+            elseif ($status -eq 'Running') { $remain += [math]::Max(0, $estSec - $since); $spent += $since }
+            elseif ($took -gt 0) { $spent += $took }
+        }
         $row.Glyph.Text = [string][char]$g; $row.Glyph.ForeColor = $col
         $row.Title.ForeColor = $(if ($status -in 'Off', 'Skipped') { $Pal.Muted } else { $Pal.Ink })
         $row.Detail.Text = $detail
@@ -908,6 +927,7 @@ function Update-AutoView {
         if ($plan.Message) { $text = [string]$plan.Message } else { $text = "Phase $($plan.Phase) is next." }
         if ($plan.Status -eq 'Failed') { $text = "Stopped: $($plan.Message)" }
     } elseif ($plan) { $text = 'All phases finished on this device.'; $label = 'Run again from Phase 1' }
+    if ($remain -gt 0 -or $spent -gt 0) { $text += "`nPhase $curPhase time: $(Format-Duration $spent) so far, about $(Format-Duration $remain) left" }
     if ($script:DryBox.Checked) { $text = "DRY RUN: nothing will change.`n$text" }
     $script:BtnStart.Text = $label
     $script:AutoStatus.Text = $text
@@ -963,6 +983,7 @@ function Get-UiParam {
 function Start-UiJob {
     param([hashtable]$Tag, [hashtable]$Params)
     $script:JobTag = $Tag
+    $script:JobStart = Get-Date
     Set-UiBusy $true
     $dry = $script:DryBox.Checked
     $script:Runspace = [runspacefactory]::CreateRunspace()
@@ -980,6 +1001,16 @@ function Start-UiJob {
         Invoke-ToolkitAction -Name $Name -Params $Params
     }).AddArgument($modulePath).AddArgument($script:Queue).AddArgument($dry).AddArgument($Tag.Name).AddArgument($Params)
     $script:Async = $script:Shell.BeginInvoke()
+}
+
+function Update-JobClock {
+    if (-not $script:JobStart -or -not $script:JobTag) { return }
+    $name = $script:JobTag.Name
+    $el = ((Get-Date) - $script:JobStart).TotalSeconds
+    $text = "ACTIVITY     $name   elapsed $(Format-Duration $el)"
+    $key = $name; if ($script:EstKey.ContainsKey($name)) { $key = $script:EstKey[$name] }
+    if ($name -ne 'RunPhase' -and $script:Est.ContainsKey($key)) { $text += "   (usually about $(Format-Duration $script:Est[$key]))" }
+    $script:LogHead.Text = $text
 }
 
 function Get-DevicePrefix {
@@ -1066,6 +1097,8 @@ function Complete-UiJob {
     $script:Shell.Dispose(); $script:Runspace.Dispose()
     $script:Shell = $null; $script:Runspace = $null; $script:Async = $null
     Set-UiBusy $false
+    if ($script:JobStart) { $script:LogHead.Text = "ACTIVITY     last: $($tag.Name) took $(Format-Duration (((Get-Date) - $script:JobStart).TotalSeconds))" }
+    $script:Est = Get-StepEstimate
     $dry = $script:DryBox.Checked
     Update-StepList
     Update-AutoView
@@ -1118,6 +1151,7 @@ $timer.Add_Tick({
         while ($script:Queue.TryDequeue([ref]$line)) { Add-LogLine $line }
         Complete-UiJob
     } elseif ($script:Busy) {
+        Update-JobClock
         $script:Tick++
         if ($script:Tick % 6 -eq 0 -and $script:JobTag -and $script:JobTag.Name -eq 'RunPhase') { Update-AutoView }
     }
