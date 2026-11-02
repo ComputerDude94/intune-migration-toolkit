@@ -781,8 +781,17 @@ function Stop-ToolkitRestart { & shutdown.exe /a 2>&1 | Out-Null; Write-ToolkitL
 
 # ----------------------------------------------------------------------------- Entra join / Intune enrollment
 
+$script:StopFlag = Join-Path $script:DataRoot 'stop.flag'
+function Request-ToolkitStop { Set-Content -Path $script:StopFlag -Value (Get-Date).ToString('s') -ErrorAction SilentlyContinue }
+
+# True when Windows has recorded an Entra join (a JoinInfo subkey exists); dsregcmd then confirms.
+function Test-EntraJoinHint {
+    $k = 'HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo'
+    (Test-Path $k) -and (@(Get-ChildItem $k -ErrorAction SilentlyContinue).Count -gt 0)
+}
+
 function Start-EntraJoin {
-    param([int]$TimeoutMin = 20)
+    param([int]$TimeoutMin = 10)
     $js = Get-JoinState
     if ($js.AzureAdJoined) { Write-ToolkitLog "Already Entra joined (tenant: $($js.TenantName))." 'OK'; Set-StepState 'JoinEntra' 'Done'; return }
     if ($js.DomainJoined) { throw 'Device is still domain joined. Unjoin Active Directory and restart first.' }
@@ -799,10 +808,26 @@ function Start-EntraJoin {
     }
     if ($script:DryRun) { return }
 
-    Write-ToolkitLog "Waiting up to $TimeoutMin minutes for Entra join to complete..."
-    $deadline = (Get-Date).AddMinutes($TimeoutMin)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 10
+    Write-ToolkitLog "Waiting for you to finish the sign-in. Checking every 3 seconds; this ends the moment the join completes (gives up after $TimeoutMin minutes, or press Stop)." 'STEP'
+    if (Test-Path $script:StopFlag) { Remove-Item $script:StopFlag -Force -ErrorAction SilentlyContinue }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $lastNote = 0; $lastCheck = 0
+    while ($sw.Elapsed.TotalMinutes -lt $TimeoutMin) {
+        Start-Sleep -Seconds 3
+        if (Test-Path $script:StopFlag) {
+            Remove-Item $script:StopFlag -Force -ErrorAction SilentlyContinue
+            Write-ToolkitLog 'Stopped by you. Run this step again when you are ready.' 'WARN'
+            Set-StepState 'JoinEntra' 'Failed' 'Stopped by user'
+            return
+        }
+        # Cheap registry check first; dsregcmd (about a second) only confirms when it looks joined.
+        # The registry hint is only a shortcut: dsregcmd is also checked every 15 seconds regardless, so a wrong hint can never miss a join.
+        $dueCheck = ($sw.Elapsed.TotalSeconds - $lastCheck) -ge 15
+        if (-not $dueCheck -and -not (Test-EntraJoinHint)) {
+            if ($sw.Elapsed.TotalSeconds - $lastNote -ge 30) { $lastNote = $sw.Elapsed.TotalSeconds; Write-ToolkitLog ("  still waiting for the join ({0}s)..." -f [int]$sw.Elapsed.TotalSeconds) }
+            continue
+        }
+        $lastCheck = $sw.Elapsed.TotalSeconds
         $js = Get-JoinState
         if ($js.AzureAdJoined) {
             Write-ToolkitLog "Entra join confirmed (tenant: $($js.TenantName)). Restart, then sign in as the Entra user." 'OK'
@@ -810,7 +835,7 @@ function Start-EntraJoin {
             return
         }
     }
-    Write-ToolkitLog 'Timed out waiting for Entra join. Re-run this step once the join completes.' 'ERROR'
+    Write-ToolkitLog "No Entra join detected after $TimeoutMin minutes. Re-run this step once the join completes." 'ERROR'
     Set-StepState 'JoinEntra' 'Failed' 'Timed out'
 }
 
@@ -1587,4 +1612,4 @@ Export-ModuleMember -Function Initialize-Toolkit, Set-ToolkitLogSink, Set-Toolki
     Get-ToolkitConfig, Get-StepState, Test-IsAdmin, Invoke-ToolkitAction, Get-WorkspaceOneInventory,
     Get-ToolkitTarget, Get-DeviceSnapshot, Get-WorkspaceOneResidue, Get-JoinState, Get-LocalAdminCandidate,
     Get-GroupTagList, Test-GroupTagName, Add-GroupTag, Remove-GroupTag,
-    Get-RunPhaseInfo, Get-RunStepDefinition, Get-RunPlanState, Clear-RunPlanState
+    Request-ToolkitStop, Get-RunPhaseInfo, Get-RunStepDefinition, Get-RunPlanState, Clear-RunPlanState

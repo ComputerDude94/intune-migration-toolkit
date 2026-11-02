@@ -642,6 +642,9 @@ $script:BtnDiscard.Add_Click({
     if ((Show-Message 'Forget the saved progress of the automatic run? Nothing on the device is changed; the next run starts at Phase 1.' 'Discard progress' 'YesNo' 'Question') -eq 'Yes') { Clear-RunPlanState; Update-AutoView }
 })
 $heroRight.Controls.AddRange(@($script:BtnStart, $script:AutoStatus, $script:BtnDiscard))
+$script:BtnStop = New-Btn 'Stop waiting' 'Danger' 196 30; $script:BtnStop.Location = New-Object System.Drawing.Point(8, 218); $script:BtnStop.Font = $Fnt.Small; $script:BtnStop.Enabled = $false
+$script:BtnStop.Add_Click({ Request-ToolkitStop; Add-LogLine ("{0} [WARN] Stop requested; the current wait will end within a few seconds." -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) })
+$heroRight.Controls.Add($script:BtnStop)
 $script:ActionButtons.Add($script:BtnStart); $script:ActionButtons.Add($script:BtnDiscard); $script:ActionButtons.Add($btnNewTagA)
 $hero.Controls.Add($heroLeft); $hero.Controls.Add($heroRight)
 Add-ToTable $auto.Table $hero
@@ -791,6 +794,7 @@ function Set-UiBusy {
     $script:Progress.Style = if ($Busy) { 'Marquee' } else { 'Continuous' }
     $script:Progress.Value = 0
     foreach ($b in $script:ActionButtons) { $b.Enabled = -not $Busy }
+    $script:BtnStop.Enabled = $Busy
     $script:DryBox.Enabled = -not $Busy
 }
 
