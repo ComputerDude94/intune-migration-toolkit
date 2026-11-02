@@ -301,6 +301,16 @@ $Fnt = @{
     Mono  = New-Object System.Drawing.Font('Consolas', 9.5)
 }
 
+# Any unhandled GUI error goes to the log with its stack trace instead of the raw .NET crash dialog.
+try { [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException) } catch {}
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($sender, $e)
+    try {
+        Write-ToolkitLog ("GUI error: " + $e.Exception.ToString()) 'ERROR'
+        Add-LogLine ("{0} [ERROR] Unexpected GUI error: {1} (full details saved in the log file)" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $e.Exception.Message)
+    } catch {}
+})
+
 # ---- control factories ---------------------------------------------------------
 
 function New-Label {
@@ -606,7 +616,7 @@ $logWrap.Controls.Add($logCard)
 
 $auto = New-Page 'Automate'
 $hero = New-Card
-$hero.Dock = 'Fill'; $hero.Height = 362; $hero.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12); $hero.Padding = New-Object System.Windows.Forms.Padding(22, 18, 18, 14)
+$hero.Dock = 'Fill'; $hero.Height = 392; $hero.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12); $hero.Padding = New-Object System.Windows.Forms.Padding(22, 18, 18, 14)
 $heroLeft = New-Object System.Windows.Forms.Panel
 $heroLeft.Dock = 'Fill'; $heroLeft.BackColor = $Pal.Card
 $heroRight = New-Object System.Windows.Forms.Panel
@@ -632,9 +642,10 @@ $script:ChkUpload = New-Check 'Upload the hash to Intune Autopilot (asks you to 
 $script:ChkProf   = New-Check 'Open Profile Wizard in the last phase (you finish it by hand)' $true 196
 $script:ChkDebloat = New-Check 'Remove the preinstalled apps listed in Config\toolkit.json' $true 224
 $script:ChkTempAdmin = New-Check 'Remove the temporary local admin when finished' $false 252
+$script:ChkCompliance = New-Check 'Wait for Intune to report compliant (asks you to sign in)' $false 280
 $note = New-Label 'Only this computer is touched. Remote sessions and network locations are refused. Domain credentials are used once, in memory, to remove this computer from AD.' $Fnt.Small $Pal.Muted $Pal.Card
-$note.Location = New-Object System.Drawing.Point(0, 282); $note.Size = New-Object System.Drawing.Size(470, 40)
-$heroLeft.Controls.AddRange(@($hl1, $hl2, $script:ChkHash, $tagLbl, $script:TagBoxAuto, $btnNewTagA, $script:ChkUpload, $script:ChkProf, $script:ChkDebloat, $script:ChkTempAdmin, $note))
+$note.Location = New-Object System.Drawing.Point(0, 312); $note.Size = New-Object System.Drawing.Size(470, 40)
+$heroLeft.Controls.AddRange(@($hl1, $hl2, $script:ChkHash, $tagLbl, $script:TagBoxAuto, $btnNewTagA, $script:ChkUpload, $script:ChkProf, $script:ChkDebloat, $script:ChkTempAdmin, $script:ChkCompliance, $note))
 
 $script:BtnStart = New-Btn 'Start automatic run' 'Primary' 196 52
 $script:BtnStart.Location = New-Object System.Drawing.Point(8, 4); $script:BtnStart.Font = $Fnt.Big
@@ -868,7 +879,7 @@ function Get-AutoOption {
     @{
         GroupTag = $script:TagBoxAuto.Text.Trim(); OutputFolder = $script:OutBox.Text.Trim()
         CaptureHash = $script:ChkHash.Checked; UploadHash = $script:ChkUpload.Checked
-        LaunchProfwiz = $script:ChkProf.Checked; Debloat = $script:ChkDebloat.Checked; RemoveTempAdmin = $script:ChkTempAdmin.Checked
+        CheckCompliance = $script:ChkCompliance.Checked; LaunchProfwiz = $script:ChkProf.Checked; Debloat = $script:ChkDebloat.Checked; RemoveTempAdmin = $script:ChkTempAdmin.Checked
     }
 }
 

@@ -880,6 +880,32 @@ function Complete-IntuneVerification {
     if ($ok) { Set-StepState 'VerifyIntune' 'Done' } else { Set-StepState 'VerifyIntune' 'Failed' }
 }
 
+# Optional: wait until Intune shows this device as compliant (signs in to Graph; read-only).
+function Wait-IntuneReady {
+    param([int]$TimeoutMin = 15)
+    Connect-IntuneGraph
+    $serial = (Get-ToolkitTarget).Serial
+    $q = $serial -replace "'", "''"
+    $base = 'https://graph.microsoft.com/v1.0/deviceManagement'
+    $ap = Invoke-MgGraphRequest -Method GET -Uri ($base + "/windowsAutopilotDeviceIdentities?`$filter=contains(serialNumber,'$q')")
+    $mine = @($ap.value | Where-Object { $_.serialNumber -eq $serial })
+    if ($mine.Count -gt 0) { Write-ToolkitLog "Autopilot: groupTag='$($mine[0].groupTag)', profile status '$($mine[0].deploymentProfileAssignmentStatus)'." }
+    else { Write-ToolkitLog 'This serial is not registered in Autopilot (fine for an in-place join).' }
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $last = -30
+    if (Test-Path $script:StopFlag) { Remove-Item $script:StopFlag -Force -ErrorAction SilentlyContinue }
+    while ($sw.Elapsed.TotalMinutes -lt $TimeoutMin) {
+        $md = Invoke-MgGraphRequest -Method GET -Uri ($base + "/managedDevices?`$filter=serialNumber%20eq%20'$q'")
+        $dev = @($md.value)[0]
+        if ($dev) {
+            if ($dev.complianceState -eq 'compliant') { Write-ToolkitLog "Intune reports '$($dev.deviceName)' as compliant (last sync $($dev.lastSyncDateTime))." 'OK'; return 'compliant' }
+            if ($sw.Elapsed.TotalSeconds - $last -ge 30) { $last = $sw.Elapsed.TotalSeconds; Write-ToolkitLog "Intune sees the device; compliance is '$($dev.complianceState)'. Waiting..." }
+        } elseif ($sw.Elapsed.TotalSeconds - $last -ge 30) { $last = $sw.Elapsed.TotalSeconds; Write-ToolkitLog 'Device not visible in Intune yet. Waiting...' }
+        if (Test-Path $script:StopFlag) { Remove-Item $script:StopFlag -Force -ErrorAction SilentlyContinue; throw 'Stopped by you.' }
+        Start-Sleep -Seconds 10
+    }
+    throw "Intune did not report the device as compliant within $TimeoutMin minutes (it may still be applying policy)."
+}
+
 # ----------------------------------------------------------------------------- profile wizard and tools
 
 function Start-ProfileWizard {
@@ -1067,7 +1093,7 @@ function Import-AutopilotToIntune {
         if ($p | Where-Object { $_ -like 'missing*' -or $_ -like '*base64*' }) { throw "Invalid row for '$($row.'Device Serial Number')': $($p -join '; ')" }
     }
     Connect-IntuneGraph
-    $base = 'https://graph.microsoft.com/beta/deviceManagement'
+    $base = 'https://graph.microsoft.com/v1.0/deviceManagement'
     $results = New-Object System.Collections.Generic.List[object]
     $pending = @{}
 
@@ -1127,7 +1153,7 @@ function Get-IntuneDeviceReport {
     if (-not $Serial) { $Serial = (Get-CimInstance Win32_BIOS).SerialNumber.Trim() }
     Connect-IntuneGraph
     $q = $Serial -replace "'", "''"
-    $base = 'https://graph.microsoft.com/beta/deviceManagement'
+    $base = 'https://graph.microsoft.com/v1.0/deviceManagement'
     $ap = Invoke-MgGraphRequest -Method GET -Uri ($base + "/windowsAutopilotDeviceIdentities?`$filter=contains(serialNumber,'$q')")
     $md = Invoke-MgGraphRequest -Method GET -Uri ($base + "/managedDevices?`$filter=serialNumber%20eq%20'$q'")
     $out = New-Object System.Collections.Generic.List[object]
@@ -1177,6 +1203,17 @@ function Get-DataAtRiskReport {
         if ($local -gt 0 -or $pstPst.Count -gt 0) { $status = 'Warn'; $risk = $true }
         $rows.Add((New-Check "Profile $name" $status $detail))
         foreach ($f in $pstPst) { $rows.Add((New-Check "  PST file ($name)" 'Warn' ("{0} ({1}) is local only - copy it somewhere safe" -f $f.FullName, (Format-Size $f.Length)))) }
+    }
+    try {
+        foreach ($dk in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | Where-Object { $_.DeviceID -ne $env:SystemDrive })) {
+            $used = [long]($dk.Size - $dk.FreeSpace)
+            $rows.Add((New-Check "Other drive $($dk.DeviceID)" $(if ($used -gt 100MB) { 'Warn' } else { 'Info' }) ("{0} used. Data on a second drive is not in any profile or OneDrive backup; check it before a wipe." -f (Format-Size $used))))
+            if ($used -gt 100MB) { $risk = $true }
+        }
+    } catch {}
+    if ($profiles.Count -gt 0) {
+        if (Get-Process -Name OneDrive -ErrorAction SilentlyContinue) { $rows.Add((New-Check 'OneDrive client' 'Info' 'Running. Before cutover, confirm its tray icon says "Up to date" - this tool cannot see pending uploads.')) }
+        else { $rows.Add((New-Check 'OneDrive client' 'Warn' 'Not running, so nothing is syncing right now.')) }
     }
     $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive' -ErrorAction SilentlyContinue
     if ($pol -and ($pol.KFMSilentOptIn -or $pol.KFMOptInWithWizard)) { $rows.Add((New-Check 'OneDrive Known Folder Move policy' 'Pass' 'Configured on this device')) }
@@ -1238,7 +1275,14 @@ function New-MigrationReport {
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         Set-Content -Path $file -Value $lines -Encoding UTF8
     } | Out-Null
-    if (-not $script:DryRun) { Write-ToolkitLog "Migration report saved: $file" 'OK' }
+    if (-not $script:DryRun) {
+        $failed = (@(Get-StepState | Where-Object { $_.Status -eq 'Failed' } | ForEach-Object { $_.Step }) -join ' ')
+        $intuneOn = (@(Get-MdmEnrollment | Where-Object { $_.Kind -eq 'Intune' }).Count -gt 0)
+        [pscustomobject][ordered]@{ Time = (Get-Date).ToString('s'); ComputerName = $t.ComputerName; Serial = $t.Serial; AdJoined = $js.DomainJoined; EntraJoined = $js.AzureAdJoined
+            Tenant = $js.TenantName; IntuneEnrolled = $intuneOn; Ws1Clean = ($res.Count -eq 0); FailedSteps = $failed } |
+            Export-Csv -Path (Join-Path $dir 'fleet.csv') -Append -NoTypeInformation -Encoding ASCII
+        Write-ToolkitLog "Migration report saved: $file (one-line summary added to fleet.csv)" 'OK'
+    }
     $file
 }
 
@@ -1281,7 +1325,7 @@ $script:TimingPath = Join-Path $script:DataRoot 'timings.json'
 
 function Get-StepEstimate {
     $est = @{
-        LocalAdmin = 10; Preflight = 30; DataCheck = 90; BitLockerPrep = 20; CaptureHash = 15; UploadHash = 180; RemoveWS1 = 300; RemoveSCCM = 180
+        LocalAdmin = 10; IntuneReady = 300; Preflight = 30; DataCheck = 90; BitLockerPrep = 20; CaptureHash = 15; UploadHash = 180; RemoveWS1 = 300; RemoveSCCM = 180
         UnjoinAD = 45; VerifyWS1Gone = 30; JoinEntra = 180; VerifyIntune = 120; ProfileWizard = 600; Debloat = 90; RemoveTempAdmin = 10; Report = 10
     }
     if (Test-Path $script:TimingPath) {
@@ -1315,7 +1359,7 @@ function Resolve-RunOption {
     $o = @{
         GroupTag = ''; OutputFolder = (Join-Path $script:ToolkitRoot 'Output\Autopilot')
         CaptureHash = $true; UploadHash = $false; Offline = $false
-        Debloat = $true; LaunchProfwiz = $true; RemoveTempAdmin = $false
+        Debloat = $true; LaunchProfwiz = $true; RemoveTempAdmin = $false; CheckCompliance = $false
     }
     if ($Saved) { foreach ($k in @($o.Keys)) { if ($Saved.PSObject.Properties.Name -contains $k -and $null -ne $Saved.$k) { $o[$k] = $Saved.$k } } }
     foreach ($k in @($o.Keys)) { if ($New.ContainsKey($k) -and $null -ne $New[$k]) { $o[$k] = $New[$k] } }
@@ -1339,6 +1383,7 @@ function Get-RunStepDefinition {
         @{ Phase = 2; Id = 'VerifyWS1Gone';    Title = 'Confirm Workspace ONE is completely gone';      Optional = $false; Enabled = $true }
         @{ Phase = 2; Id = 'JoinEntra';        Title = 'Join Entra ID';                                Optional = $false; Enabled = $true }
         @{ Phase = 2; Id = 'VerifyIntune';     Title = 'Verify Intune enrollment and back up BitLocker key'; Optional = $false; Enabled = $true }
+        @{ Phase = 2; Id = 'IntuneReady';      Title = 'Wait for Intune to report the device compliant'; Optional = $true;  Enabled = [bool]$o.CheckCompliance }
         @{ Phase = 3; Id = 'ProfileWizard';    Title = 'Profile migration (Profile Wizard, finish by hand)'; Optional = $true; Enabled = [bool]$o.LaunchProfwiz }
         @{ Phase = 3; Id = 'Debloat';          Title = 'Remove preinstalled apps';                     Optional = $true;  Enabled = [bool]$o.Debloat }
         @{ Phase = 3; Id = 'RemoveTempAdmin';  Title = 'Remove temporary local admin';                 Optional = $true;  Enabled = [bool]$o.RemoveTempAdmin }
@@ -1438,6 +1483,10 @@ function Invoke-RunStep {
             $m = @($rows | Where-Object { $_.Status -eq 'Warn' }).Count
             Set-RunOutcome 'Done' $(if ($m) { "clean, $m item(s) to check by hand" } else { 'completely clean' })
         }
+        'IntuneReady' {
+            if ($script:DryRun) { Write-ToolkitLog 'DRY-RUN: would sign in to Graph and wait for Intune compliance' 'WARN'; Set-RunOutcome 'DryRun'; return }
+            Set-RunOutcome 'Done' (Wait-IntuneReady)
+        }
         'Report' { $f = New-MigrationReport; $st = 'Done'; if ($script:DryRun) { $st = 'DryRun' }; Set-RunOutcome $st ([string]$f) }
         'CaptureHash' {
             $file = Invoke-AutopilotCapture -GroupTag $Options.GroupTag -OutputFolder $Options.OutputFolder
@@ -1521,7 +1570,7 @@ function Invoke-MigrationRun {
         Version = 1; Created = (Get-Date).ToString('s'); Updated = ''; Phase = $FromPhase; Status = 'InProgress'; Message = ''
         Device = @{ ComputerName = $target.ComputerName; Serial = $target.Serial; MachineGuid = $target.MachineGuid }
         Options = @{ GroupTag = $opt.GroupTag; OutputFolder = $opt.OutputFolder; CaptureHash = [bool]$opt.CaptureHash; UploadHash = [bool]$opt.UploadHash
-                     Offline = [bool]$opt.Offline; Debloat = [bool]$opt.Debloat; LaunchProfwiz = [bool]$opt.LaunchProfwiz; RemoveTempAdmin = [bool]$opt.RemoveTempAdmin }
+                     Offline = [bool]$opt.Offline; Debloat = [bool]$opt.Debloat; LaunchProfwiz = [bool]$opt.LaunchProfwiz; RemoveTempAdmin = [bool]$opt.RemoveTempAdmin; CheckCompliance = [bool]$opt.CheckCompliance }
         Steps = (New-Object System.Collections.ArrayList)
     }
     foreach ($d in $defs) {

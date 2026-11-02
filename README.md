@@ -36,6 +36,15 @@ Behaviour that makes it safe to leave running:
 - **Dry run** walks all three phases and changes nothing (it writes a separate preview plan file).
 - Credentials and the temporary-admin password are held in memory for that run only; the saved plan contains no secrets.
 
+## Also in the toolkit
+
+- **Intune readiness (optional):** tick *Wait for Intune to report compliant* and Phase 2 signs in to Graph, logs the Autopilot group tag / profile status, and waits until Intune shows the device compliant (read-only).
+- **Fleet summary:** each migration report also appends one line to `Output\Reports\fleet.csv` (serial, name, AD/Entra/Intune state, Workspace ONE clean, failed steps), so reports from many devices on a USB drive can be opened as one spreadsheet.
+- **Time estimates:** each step shows an estimate and a live timer; estimates become the median of your own past runs.
+- **Error capture:** unexpected GUI errors are written to the log with a full stack trace instead of showing the raw .NET crash dialog.
+- **Checks:** `Tests\Engine.Tests.ps1` (mocked, runs anywhere) and a GitHub Actions workflow run the parse check, PSScriptAnalyzer and the logic tests on Windows PowerShell 5.1 for every push.
+- **Direct Autopilot upload** uses Microsoft Graph (`importedWindowsAutopilotDeviceIdentity`, v1.0, scope `DeviceManagementServiceConfig.ReadWrite.All`, work or school account). The request shape matches Microsoft's documentation, but it has not been run against a real tenant: try one device first.
+
 ## Workspace ONE: proof it is gone
 
 Removal is verified, not assumed. The check (Step by step > *Verify Workspace ONE is gone*, and automatically at the start of Phase 2) looks for: programs matched by name **or** publisher (so old AirWatch agents and rebranded Omnissa/VMware Hubs are caught, while VMware Tools is not), Store apps, MDM enrollments, services, running processes, scheduled tasks (including orphaned enrollment tasks), leftover folders and registry keys, device certificates, CA certificates, provisioning packages, orphaned installer records and per-user data folders. It removes what is safe to remove (services, processes, tasks, device certificates, vendor folders and keys) and lists the rest as items to check by hand. Phase 2 will not continue until nothing removable is left. The names it matches are in `Config\toolkit.json` (`ws1Names`, `ws1Publishers`, `ws1AppxNames`). It cannot see the Workspace ONE console: retire the device there too.

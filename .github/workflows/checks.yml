@@ -1,0 +1,23 @@
+name: checks
+on: [push, pull_request]
+jobs:
+  windows-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse both scripts (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          foreach ($f in 'MigrationToolkit.ps1','Modules\MigrationCore.psm1') {
+            $e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$e)
+            if ($e.Count) { $e | ForEach-Object { Write-Error "$f line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+          }
+      - name: PSScriptAnalyzer (errors only)
+        shell: powershell
+        run: |
+          $r = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error -ExcludeRule PSAvoidUsingConvertToSecureStringWithPlainText
+          $r | Format-Table -AutoSize
+          if ($r) { exit 1 }
+      - name: Logic tests
+        shell: powershell
+        run: .\Tests\Engine.Tests.ps1
