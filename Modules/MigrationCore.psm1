@@ -20,6 +20,14 @@ function Initialize-Toolkit {
         if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
     }
     $script:LogFile = Join-Path $script:LogDir ("toolkit-{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
+    # Standard users must not be able to edit the saved plan or logs: administrators/SYSTEM full control, users read only.
+    $mark = Join-Path $script:DataRoot '.secured'
+    if (-not (Test-Path $mark) -and (Test-IsAdmin)) {
+        try {
+            & icacls.exe $script:DataRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+            Set-Content -Path $mark -Value 'permissions restricted' -ErrorAction SilentlyContinue
+        } catch {}
+    }
 }
 
 function Set-ToolkitLogSink { param($Queue) $script:LogSink = $Queue }
@@ -44,6 +52,7 @@ function Get-ToolkitConfig {
         workgroupName = 'WORKGROUP'
         ws1Names      = @('*Workspace ONE*', '*AirWatch*', '*Intelligent Hub*')
         ws1Publishers = @('AirWatch*')
+        trustedToolHashes = @()
         ws1AppxNames  = @('*WorkspaceONE*', '*Workspace ONE*', '*AirWatch*')
         ws1CleanupPaths = @('HKLM:\SOFTWARE\AirWatch', 'HKLM:\SOFTWARE\WOW6432Node\AirWatch', "$env:ProgramData\AirWatch", "$env:ProgramData\VMware\SetupAssistant", "$env:ProgramFiles\AirWatch", "${env:ProgramFiles(x86)}\AirWatch")
         debloat       = @('Microsoft.Todos', 'Microsoft.BingWeather', 'Microsoft.ZuneVideo', 'MicrosoftTeams', 'Microsoft.ZuneMusic', 'Microsoft.YourPhone',
@@ -92,8 +101,10 @@ function Invoke-Mutation {
 }
 
 function Test-IsAdmin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { $false }
 }
 
 # ----------------------------------------------------------------------------- device scope guard
@@ -519,7 +530,7 @@ function Get-WorkspaceOneResidue {
         foreach ($pr in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -match 'AirWatch|Workspace ?ONE' })) { & $add 'Process' "$($pr.ProcessName) ($($pr.Id))" $pr.Path 'auto' }
     } catch {}
     try {
-        $liveIds = @(Get-MdmEnrollment | ForEach-Object { $_.Id })
+        $liveIds = @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue | ForEach-Object { $_.PSChildName })
         foreach ($tk in @(Get-ScheduledTask -ErrorAction Stop)) {
             $orphan = ($tk.TaskPath -match 'EnterpriseMgmt\\([0-9A-Fa-f-]{36})\\' -and $liveIds -notcontains $Matches[1])
             if ($orphan -or $tk.TaskPath -match 'AirWatch|Workspace ?ONE' -or $tk.TaskName -match 'AirWatch|Workspace ?ONE') { & $add 'Scheduled task' "$($tk.TaskPath)$($tk.TaskName)" '' 'auto' }
@@ -799,7 +810,10 @@ function Start-EntraJoin {
 
     $ppkg = @(Get-ChildItem -Path (Join-Path $script:ToolkitRoot 'Tools') -Filter '*.ppkg' -ErrorAction SilentlyContinue)
     if ($ppkg.Count -gt 1) { Write-ToolkitLog "More than one .ppkg in Tools\ - using $($ppkg[0].Name). Remove the others to be sure which tenant you join." 'WARN' }
-    if ($ppkg.Count -gt 0) {
+    $ppkgHash = ''; if ($ppkg.Count -gt 0) { $ppkgHash = (Get-FileHash -Path $ppkg[0].FullName -Algorithm SHA256).Hash }
+    $ppkgTrusted = ($ppkg.Count -gt 0) -and (Test-ToolTrusted ([pscustomobject]@{ SignatureStatus = 'n/a'; Sha256 = $ppkgHash }))
+    if ($ppkg.Count -gt 0 -and -not $ppkgTrusted) { Write-ToolkitLog "Provisioning package $($ppkg[0].Name) is NOT in trustedToolHashes, so it will not be installed silently (a package can join any tenant). SHA-256: $ppkgHash. Add the hash to Config\toolkit.json if it is yours; using the manual join instead." 'WARN' }
+    if ($ppkgTrusted) {
         Write-ToolkitLog "Provisioning package found: $($ppkg[0].Name) sha256=$((Get-FileHash -Path $ppkg[0].FullName -Algorithm SHA256).Hash) - installing silently" 'STEP'
         Invoke-Mutation "install provisioning package $($ppkg[0].Name)" { Install-ProvisioningPackage -PackagePath $ppkg[0].FullName -QuietInstall -ForceInstall -ErrorAction Stop } | Out-Null
     } else {
@@ -918,6 +932,9 @@ function Start-ProfileWizard {
     elseif (Test-Path $exe) { $target = $exe }
     elseif (Test-Path $msi) {
         # The MSI only extracts Profwiz.exe to its install directory.
+        $mi = Get-ToolFileInfo -Path $msi
+        Write-ToolkitLog "Profwiz.msi: signature=$($mi.SignatureStatus) sha256=$($mi.Sha256)"
+        if (-not (Test-ToolTrusted $mi)) { throw "Profwiz.msi is not validly signed and its hash is not in trustedToolHashes (Config\toolkit.json). SHA-256: $($mi.Sha256)" }
         Write-ToolkitLog 'Installing User Profile Wizard from Profwiz.msi' 'STEP'
         Invoke-Mutation 'run Profwiz.msi installer (interactive)' { Start-Process -FilePath 'msiexec.exe' -ArgumentList "/i `"$msi`"" -Wait } | Out-Null
         $installed = Get-ChildItem -Path "${env:ProgramFiles(x86)}\ForensiT", "$env:ProgramFiles\ForensiT" -Filter 'Profwiz.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -927,10 +944,21 @@ function Start-ProfileWizard {
 
     $info = Get-ToolFileInfo -Path $target
     Write-ToolkitLog "Profwiz: signature=$($info.SignatureStatus) signer=$($info.Signer) sha256=$($info.Sha256)"
-    if ($info.SignatureStatus -ne 'Valid') { Write-ToolkitLog 'Profwiz signature is not Valid - verify the file before continuing.' 'WARN' }
+    if (-not (Test-ToolTrusted $info)) {
+        $msg = "Profwiz is not validly signed and its hash is not in trustedToolHashes (Config\toolkit.json). SHA-256: $($info.Sha256). If you verified this file yourself, add that hash to the list."
+        if ($script:DryRun) { Write-ToolkitLog "DRY-RUN: $msg" 'WARN' } else { throw $msg }
+    }
     Write-ToolkitLog 'Launching User Profile Wizard (GUI). Sign in as the new Entra user first, run as administrator, and pick the old domain profile.' 'STEP'
     Invoke-Mutation "launch $target" { Start-Process -FilePath $target -Wait } | Out-Null
     Set-StepState 'ProfileWizard' 'Done' 'Launched; confirm result manually'
+}
+
+# A tool runs elevated, so it must be validly signed or its SHA-256 must be listed in Config\toolkit.json (trustedToolHashes).
+function Test-ToolTrusted {
+    param([Parameter(Mandatory)]$Info)
+    if ($Info.SignatureStatus -eq 'Valid') { return $true }
+    $trusted = @((Get-ToolkitConfig).trustedToolHashes | ForEach-Object { "$_".Trim().ToUpper() })
+    $trusted -contains "$($Info.Sha256)".ToUpper()
 }
 
 function Invoke-ToolExecutable {
@@ -939,20 +967,23 @@ function Invoke-ToolExecutable {
     if (-not (Test-Path $path)) { throw "$Name not found in Tools folder." }
     $info = Get-ToolFileInfo -Path $path
     Write-ToolkitLog "$Name signature=$($info.SignatureStatus) signer=$($info.Signer) sha256=$($info.Sha256)"
-    if ($info.SignatureStatus -ne 'Valid') { Write-ToolkitLog "$Name is not validly signed. Not running it." 'ERROR'; return }
+    if (-not (Test-ToolTrusted $info)) { Write-ToolkitLog "$Name is not validly signed and its hash is not in trustedToolHashes (Config\toolkit.json). Not running it. SHA-256: $($info.Sha256)" 'ERROR'; return }
     Invoke-Mutation "run $Name (interactive, waits for exit)" { Start-Process -FilePath $path -Wait } | Out-Null
     Write-ToolkitLog "$Name finished." 'OK'
 }
 
 function Invoke-Debloat {
     $cfg = Get-ToolkitConfig
+    $protected = '^(Microsoft\.WindowsStore|Microsoft\.StorePurchaseApp|Microsoft\.DesktopAppInstaller|Microsoft\.SecHealthUI|Microsoft\.AAD\.BrokerPlugin|Microsoft\.Windows\.|MicrosoftWindows\.|windows\.|Microsoft\.UI\.Xaml|Microsoft\.VCLibs|Microsoft\.NET\.|Microsoft\.WindowsAppRuntime|Microsoft\.LockApp|Microsoft\.Win32WebViewHost|MicrosoftEdge)'
     foreach ($n in $cfg.debloat) {
-        foreach ($pkg in @(Get-AppxPackage -AllUsers | Where-Object { $_.Name -like "*$n*" -or $_.PackageFamilyName -like "*$n*" })) {
+        # A too-short or wildcard entry would match half of Windows, so it is skipped; system, framework and protected packages are never removed.
+        if ("$n".Trim().Length -lt 6 -or "$n" -match '[\*\?]') { Write-ToolkitLog "Skipping debloat entry '$n': it must be at least 6 characters with no wildcards." 'WARN'; continue }
+        foreach ($pkg in @(Get-AppxPackage -AllUsers | Where-Object { ($_.Name -like "*$n*" -or $_.PackageFamilyName -like "*$n*") -and -not $_.IsFramework -and $_.SignatureKind -ne 'System' -and $_.Name -notmatch $protected })) {
             Invoke-Mutation "remove app package $($pkg.Name) for all users" {
                 try { Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop } catch { Write-ToolkitLog "  $($pkg.Name): $($_.Exception.Message)" 'WARN' }
             } | Out-Null
         }
-        foreach ($prov in @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$n*" })) {
+        foreach ($prov in @(Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$n*" -and $_.DisplayName -notmatch $protected })) {
             Invoke-Mutation "remove provisioned package $($prov.DisplayName)" {
                 try { Remove-AppxProvisionedPackage -Online -PackageName $prov.PackageName -ErrorAction Stop | Out-Null } catch { Write-ToolkitLog "  $($prov.DisplayName): $($_.Exception.Message)" 'WARN' }
             } | Out-Null
@@ -1081,6 +1112,10 @@ function Connect-IntuneGraph {
         $ctx = Get-MgContext
     }
     Write-ToolkitLog "Signed in to Graph as $($ctx.Account) (tenant $($ctx.TenantId))." 'OK'
+}
+
+function Disconnect-IntuneGraph {
+    try { if ((Get-Command Disconnect-MgGraph -ErrorAction SilentlyContinue) -and (Get-MgContext)) { Disconnect-MgGraph | Out-Null; Write-ToolkitLog 'Signed out of Microsoft Graph.' } } catch {}
 }
 
 function Import-AutopilotToIntune {
@@ -1267,6 +1302,9 @@ function New-MigrationReport {
     $lines.Add("Workspace ONE leftovers : $left")
     $lines.Add("SCCM client present     : $((Get-SccmClientStatus).ServiceInstalled)")
     try { $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop; $lines.Add("BitLocker               : protection $($bl.ProtectionStatus), recovery passwords $(@($bl.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' }).Count)") } catch { $lines.Add('BitLocker               : not available') }
+    $adm = $false; try { $adm = [bool](Get-LocalUser -Name (Get-ToolkitAdminName) -ErrorAction SilentlyContinue) } catch {}
+    $lines.Add("Temporary local admin   : $(if ($adm) { 'STILL PRESENT - remove it, or manage local admins with Windows LAPS' } else { 'not present' })")
+    if ($adm) { Write-ToolkitLog 'The temporary local admin still exists. Remove it when no longer needed (a shared password across devices is a risk).' 'WARN' }
     $lines.Add(''); $lines.Add('Step results:')
     foreach ($st in @(Get-StepState)) { $lines.Add(("  {0,-14} {1,-8} {2}  {3}" -f $st.Step, $st.Status, $st.Time, $st.Detail)) }
     $dir = Join-Path $script:ToolkitRoot 'Output\Reports'
@@ -1485,7 +1523,8 @@ function Invoke-RunStep {
         }
         'IntuneReady' {
             if ($script:DryRun) { Write-ToolkitLog 'DRY-RUN: would sign in to Graph and wait for Intune compliance' 'WARN'; Set-RunOutcome 'DryRun'; return }
-            Set-RunOutcome 'Done' (Wait-IntuneReady)
+            try { $ready = Wait-IntuneReady } finally { Disconnect-IntuneGraph }
+            Set-RunOutcome 'Done' $ready
         }
         'Report' { $f = New-MigrationReport; $st = 'Done'; if ($script:DryRun) { $st = 'DryRun' }; Set-RunOutcome $st ([string]$f) }
         'CaptureHash' {
@@ -1501,6 +1540,7 @@ function Invoke-RunStep {
             foreach ($x in $res) { Write-ToolkitLog "RESULT $($x.Serial): $($x.Result) $($x.Detail)" }
             $bad = @($res | Where-Object { $_.Result -notin 'complete', 'AlreadyRegistered' })
             if ($bad.Count -gt 0) { throw "Autopilot upload did not complete: $(($bad | ForEach-Object { "$($_.Serial) $($_.Result)" }) -join '; ')" }
+            Disconnect-IntuneGraph
             Set-RunOutcome 'Done' (($res | ForEach-Object { $_.Result }) -join ', ')
         }
         'RemoveWS1' {
@@ -1684,6 +1724,7 @@ function Invoke-ToolkitAction {
             'RemoveGroupTag'   { if ($script:DryRun) { Write-ToolkitLog "DRY-RUN: would remove group tag '$($Params.GroupTag)'" 'WARN' } else { Remove-GroupTag -Name $Params.GroupTag } }
             'ListGroupTags'    { foreach ($t in (Get-GroupTagList)) { Write-ToolkitLog "  $t" } }
             'DiscardRunPlan'   { Clear-RunPlanState }
+            'GraphSignOut'     { Disconnect-IntuneGraph }
             default            { throw "Unknown action '$Name'" }
         }
         Write-ToolkitLog "=== $Name finished ===" 'STEP'

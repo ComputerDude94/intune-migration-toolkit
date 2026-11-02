@@ -16,6 +16,7 @@
   "ws1Publishers": [
     "AirWatch*"
   ],
+  "trustedToolHashes": [],
   "ws1AppxNames": [
     "*WorkspaceONE*",
     "*Workspace ONE*",

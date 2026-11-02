@@ -8,7 +8,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Gui', 'Preflight', 'CaptureHash', 'MergeCsv', 'RemoveWS1', 'RemoveSCCM', 'JoinEntra', 'VerifyIntune', 'Debloat', 'DeviceLookup',
-                 'RunPhase', 'AddGroupTag', 'RemoveGroupTag', 'ListGroupTags', 'DiscardRunPlan', 'DataAtRisk', 'VerifyWS1Removed', 'BitLockerPrep', 'MigrationReport')]
+                 'RunPhase', 'AddGroupTag', 'RemoveGroupTag', 'ListGroupTags', 'DiscardRunPlan', 'DataAtRisk', 'VerifyWS1Removed', 'BitLockerPrep', 'MigrationReport', 'GraphSignOut')]
     [string]$Action = 'Gui',
     [string]$GroupTag = '',
     [string]$Folder = '',
@@ -757,6 +757,7 @@ Add-ActionRow $mt.Table 'Force Intune enrollment' 'Runs deviceenroller /AutoEnro
 Add-ActionRow $mt.Table 'Prepare BitLocker recovery key' 'Makes sure a recovery password exists and escrows it to Active Directory while the device is still joined. The key is never logged or saved to disk.' @{ Name = 'BitLockerPrep' } 'Prepare'
 Add-ActionRow $mt.Table 'Save migration report' 'Writes a plain-text summary (join state, Intune, Workspace ONE leftovers, BitLocker, step results) to Output\Reports.' @{ Name = 'MigrationReport' } 'Save'
 Add-ActionRow $mt.Table 'Back up BitLocker key to Entra' 'Escrows the OS-drive recovery password to Entra ID.' @{ Name = 'BackupBitLocker' } 'Back up'
+Add-ActionRow $mt.Table 'Sign out of Intune' 'Clears the Microsoft Graph sign-in (including its cached token) once you have finished with the Autopilot upload or lookups.' @{ Name = 'GraphSignOut' } 'Sign out'
 Add-ActionRow $mt.Table 'Install Graph module' 'Installs Microsoft.Graph.Authentication for the current user from PSGallery (needed for Intune upload).' @{ Name = 'InstallGraph'; Confirm = 'Download and install Microsoft.Graph.Authentication from the PowerShell Gallery?' } 'Install'
 Add-Heading $mt.Table 'Tools and power'
 Add-ActionRow $mt.Table 'Run McAfee removal (MCPR)' 'Runs Tools\MCPR.exe after checking its digital signature; refuses an unsigned file.' @{ Name = 'RunMCPR'; Confirm = 'Run the McAfee Consumer Product Removal tool?' } 'Run'
@@ -1077,7 +1078,13 @@ function Start-AutoRun {
 
     $todo = @(Get-RunStepDefinition -Options $o | Where-Object { $_.Phase -eq $phase -and $_.Enabled } | ForEach-Object { "  - $($_.Title)" })
     $info = @(Get-RunPhaseInfo | Where-Object { $_.Phase -eq $phase })[0]
-    $summary = "Phase $phase of 3: $($info.Title)`n`n$($todo -join "`n")`n`n$($info.Note)"
+    $found = ''
+    if ($phase -le 1) {
+        $inv = Get-WorkspaceOneInventory
+        $items = @($inv.Programs | ForEach-Object { "  - Program: $($_.DisplayName) $($_.Version)" }) + @($inv.Appx | ForEach-Object { "  - Store app: $($_.Name)" }) + @($inv.Enrollments | ForEach-Object { "  - MDM enrollment: $($_.ProviderId)" })
+        if ($items.Count -gt 0) { $found = "`n`nWorkspace ONE items that will be removed:`n$($items -join "`n")" } else { $found = "`n`nNo Workspace ONE items were found." }
+    }
+    $summary = "Phase $phase of 3: $($info.Title)`n`n$($todo -join "`n")$found`n`n$($info.Note)"
     if (-not $dry) {
         if ($phase -le 1) {
             $prompt = "This runs on THIS device only:`n`n    $($snap.ComputerName)   (serial $($snap.Serial))`n`n$summary`n`nTell the device's user first. Type the computer name to continue."

@@ -59,6 +59,10 @@ Pick one from the list or press **New tag**. New tags are validated (letters, nu
 - Actions that change the device are **refused** in a remote PowerShell session and when the toolkit is run from a network location (UNC path or mapped drive). Copy it to a local disk first.
 - Domain credentials are used once, for this computer's own AD object, and never stored. **Offline unjoin** needs no credentials at all. Pre-flight warns when you are signed in with a domain account, because that profile stops working after the unjoin.
 - The saved run plan is tied to this device's MachineGuid and is ignored if the folder or state is copied to another device. `-ExpectSerial` lets a script refuse to run on the wrong machine.
+- Executables and packages run elevated, so Profile Wizard, MCPR and any `.ppkg` must be validly signed or have their SHA-256 listed in `trustedToolHashes` in `Config\toolkit.json`; otherwise they are refused (a `.ppkg` falls back to the manual join). The refusal message prints the hash to add once you have verified the file yourself.
+- The app-removal list skips entries shorter than 6 characters or containing wildcards, and never removes system, framework or protected Windows packages.
+- `C:\ProgramData\MigrationToolkit` (logs, saved plan) is locked to administrators for writing, so a standard user cannot edit the plan.
+- Use **Sign out of Intune** (or let the automatic run do it) to clear the Graph token when finished. The temporary local admin is flagged in the report if it still exists; for the long term manage local admin passwords with Windows LAPS.
 - The Intune upload sends only the devices in the CSV you choose; duplicate checks match the serial number exactly.
 - It will not touch accounts or keys it did not create: the temporary admin must carry the toolkit's marker description to be reset or deleted (`Administrator`, `Guest` and similar names are rejected), the MDM cleanup refuses the Intune enrollment, and config-driven cleanup paths are limited to vendor keys under `HKLM:\SOFTWARE` and folders under ProgramData / Program Files (never `Microsoft`, `Windows`, or a drive root).
 

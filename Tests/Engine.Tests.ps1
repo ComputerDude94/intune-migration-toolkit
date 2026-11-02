@@ -154,6 +154,14 @@ $p = Get-RunPlanState
 Check 'plan records seconds per step' ($null -ne $p.Steps[0].Seconds)
 
 # scope guard
+
+# ---- tool trust
+$ti = [pscustomobject]@{ SignatureStatus = 'NotSigned'; Sha256 = 'ABC123' }
+Check 'unsigned tool with unknown hash is not trusted' (-not (& $mod { param($i) Test-ToolTrusted $i } $ti))
+Check 'validly signed tool is trusted' (& $mod { Test-ToolTrusted ([pscustomobject]@{ SignatureStatus = 'Valid'; Sha256 = 'X' }) })
+& $mod { function script:Get-ToolkitConfig { [pscustomobject]@{ trustedToolHashes = @('abc123') } } }
+Check 'unsigned tool with listed hash is trusted' (& $mod { param($i) Test-ToolTrusted $i } $ti)
+
 "`nFAILURES: $fails"
 Remove-Item $tmp -Recurse -Force
 if ($fails -gt 0) { exit 1 }
