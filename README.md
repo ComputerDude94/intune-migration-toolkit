@@ -32,7 +32,7 @@ Behaviour that makes it safe to leave running:
 
 - Everything is validated **before** the first change (AD credentials, local admin, group tag), so it cannot get half-way and then discover a missing input.
 - A required step that fails stops the run with the reason; optional steps (hash, upload, apps, Profile Wizard) warn and continue. Starting again skips the steps that already finished.
-- It confirms by asking you to type the computer name, and shows the name and serial in the header and in every log.
+- It confirms by asking you to type START (the dialog names the device), and shows the name and serial in the header and in every log.
 - **Dry run** walks all three phases and changes nothing (it writes a separate preview plan file).
 - Credentials and the temporary-admin password are held in memory for that run only; the saved plan contains no secrets.
 

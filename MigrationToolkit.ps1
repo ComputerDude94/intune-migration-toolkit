@@ -47,11 +47,11 @@ if ($Action -ne 'Gui') {
     if ($ExpectSerial) { $p.ExpectSerial = $ExpectSerial }
     if ($Action -eq 'MergeCsv' -and -not $Folder) { $p.Folder = Join-Path $PSScriptRoot 'Output\Autopilot' }
 
-    # Anything destructive needs a deliberate confirmation naming this device (skip with -Yes, or use -DryRun).
+    # Anything destructive needs a deliberate confirmation (typing START) showing this device (skip with -Yes, or use -DryRun).
     if ($Action -in 'RunPhase', 'RemoveWS1', 'RemoveSCCM', 'Debloat' -and -not $DryRun -and -not $Yes) {
         $t = Get-ToolkitTarget
-        $typed = Read-Host "This changes THIS device only: $($t.ComputerName) (serial $($t.Serial)). Type the computer name to continue"
-        if ($typed -ne $t.ComputerName) { Write-Host 'Name did not match. Nothing was changed.'; exit 1 }
+        $typed = Read-Host "This changes THIS device only: $($t.ComputerName) (serial $($t.Serial)). Type START to continue"
+        if ($typed.Trim() -ne 'START') { Write-Host 'Not confirmed. Nothing was changed.'; exit 1 }
     }
 
     if ($Action -eq 'RunPhase') {
@@ -813,6 +813,13 @@ function Set-UiBusy {
     $script:DryBox.Enabled = -not $Busy
 }
 
+function ConvertTo-CellText {
+    # ListView cells must be plain strings; step details can arrive as arrays or $null.
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    (@($Value) | ForEach-Object { "$_" }) -join '; '
+}
+
 function Update-StepList {
     $script:StepList.Items.Clear()
     $labels = [ordered]@{
@@ -822,7 +829,7 @@ function Update-StepList {
     foreach ($k in $labels.Keys) {
         $s = $state | Where-Object { $_.Step -eq $k } | Select-Object -First 1
         $item = New-Object System.Windows.Forms.ListViewItem($labels[$k])
-        if ($s) { [void]$item.SubItems.Add($s.Status); [void]$item.SubItems.Add($s.Time); [void]$item.SubItems.Add($s.Detail) }
+        if ($s) { [void]$item.SubItems.Add((ConvertTo-CellText $s.Status)); [void]$item.SubItems.Add((ConvertTo-CellText $s.Time)); [void]$item.SubItems.Add((ConvertTo-CellText $s.Detail)) }
         else    { [void]$item.SubItems.Add('Not run'); [void]$item.SubItems.Add(''); [void]$item.SubItems.Add('') }
         $status = $item.SubItems[1].Text
         if ($status -eq 'Done') { $item.ForeColor = $Pal.Ok }
@@ -836,8 +843,8 @@ function Update-CheckList {
     $script:CheckList.Items.Clear()
     foreach ($c in @($Checks)) {
         if (-not ($c.PSObject.Properties.Name -contains 'Status')) { continue }
-        $item = New-Object System.Windows.Forms.ListViewItem($c.Status)
-        [void]$item.SubItems.Add($c.Name); [void]$item.SubItems.Add($c.Detail)
+        $item = New-Object System.Windows.Forms.ListViewItem((ConvertTo-CellText $c.Status))
+        [void]$item.SubItems.Add((ConvertTo-CellText $c.Name)); [void]$item.SubItems.Add((ConvertTo-CellText $c.Detail))
         switch ($c.Status) {
             'Pass' { $item.ForeColor = $Pal.Ok }
             'Warn' { $item.ForeColor = $Pal.Warn }
@@ -1087,9 +1094,9 @@ function Start-AutoRun {
     $summary = "Phase $phase of 3: $($info.Title)`n`n$($todo -join "`n")$found`n`n$($info.Note)"
     if (-not $dry) {
         if ($phase -le 1) {
-            $prompt = "This runs on THIS device only:`n`n    $($snap.ComputerName)   (serial $($snap.Serial))`n`n$summary`n`nTell the device's user first. Type the computer name to continue."
+            $prompt = "This runs on THIS device only:`n`n    $($snap.ComputerName)   (serial $($snap.Serial))`n`n$summary`n`nTell the device's user first. Type START to continue."
             $typed = Show-InputDialog -Title 'Confirm automatic run' -Prompt $prompt -OkText 'Start' -Initial ''
-            if ($null -eq $typed -or $typed.Trim() -ne $snap.ComputerName) { if ($null -ne $typed) { Show-Message 'The name did not match, so nothing was started.' 'Not started' 'OK' 'Information' | Out-Null }; return }
+            if ($null -eq $typed -or $typed.Trim() -ne 'START') { if ($null -ne $typed) { Show-Message 'You did not type START, so nothing was started.' 'Not started' 'OK' 'Information' | Out-Null }; return }
         } else {
             if ((Show-Message ((Get-DevicePrefix) + $summary + "`n`nStart this phase?") 'Confirm phase' 'YesNo' 'Question') -ne 'Yes') { return }
         }
