@@ -53,6 +53,10 @@ Removal is verified, not assumed. The check (Step by step > *Verify Workspace ON
 
 Pick one from the list or press **New tag**. New tags are validated (letters, numbers, spaces, `- _ .`, up to 128 characters), de-duplicated ignoring case, and saved to `Config\grouptags.user.json` (or `C:\ProgramData\MigrationToolkit` if the toolkit folder is read-only) so they appear in every list. The tag is written into each captured CSV and checked again when CSVs are merged or uploaded. Built-in tags live in `Config\toolkit.json`; only tags you added can be deleted.
 
+### One shared CSV for every device
+
+Each captured device always gets its own `<serial>_AutoPilotSetup.csv` in the CSV folder (pick any folder with Browse). Turn on **Also add to one shared CSV** (Autopilot page, or `-SharedCsv <path>` on the command line) and the device is also added to a single central file: one header row, then one line per device. Running it again replaces that device's own line instead of duplicating it. The file is opened exclusively while writing, so several technicians can use the same file; they wait their turn. Capture before leaving AD if the file is on a network share, since the share access depends on the signed-in domain account. Restrict who can read the file: a hardware hash can register a device in your tenant.
+
 ## Safety model: this device only
 
 - No function takes a computer name, opens a remote session or uses `-ComputerName` / `Invoke-Command`; every action targets the machine it runs on. `Remove-Computer` is deliberately called without `-ComputerName`.

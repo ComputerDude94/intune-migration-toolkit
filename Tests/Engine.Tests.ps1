@@ -162,6 +162,18 @@ Check 'validly signed tool is trusted' (& $mod { Test-ToolTrusted ([pscustomobje
 & $mod { function script:Get-ToolkitConfig { [pscustomobject]@{ trustedToolHashes = @('abc123') } } }
 Check 'unsigned tool with listed hash is trusted' (& $mod { param($i) Test-ToolTrusted $i } $ti)
 
+# ---- shared CSV: one header, one line per device, re-run replaces its own line
+$sc = Join-Path $tmp 'share\AutopilotHashes.csv'
+$add = { param($ser, $tag, $hash) & $mod { param($p, $s, $t, $h) Add-AutopilotSharedRow -Path $p -Info ([pscustomobject]@{ Serial = $s; ProductId = ''; Hash = $h }) -GroupTag $t } $sc $ser $tag $hash }
+[void](& $add 'S1' 'TagA' 'QUJD'); [void](& $add 'S2' 'TagB' 'REVG'); $n = & $add 'S1' 'TagC' 'R0hJ'
+$lines = @(Get-Content $sc)
+Check 'shared csv has one header plus one line per device' ($lines.Count -eq 3 -and $lines[0] -like '*Device Serial Number*' -and @($lines | ? { $_ -like '*Device Serial Number*' }).Count -eq 1)
+Check 'shared csv re-run replaces the same serial' ($n -eq 2 -and (@(Import-Csv $sc | ? { $_.'Device Serial Number' -eq 'S1' }).Count -eq 1) -and (Import-Csv $sc | ? { $_.'Device Serial Number' -eq 'S1' }).'Group Tag' -eq 'TagC')
+$bad = Join-Path $tmp 'other.csv'; Set-Content $bad "Name,Value``
+x,1"
+$threw = $false; try { [void](& $mod { param($p) Add-AutopilotSharedRow -Path $p -Info ([pscustomobject]@{ Serial = 'S9'; ProductId = ''; Hash = 'QQ==' }) } $bad) } catch { $threw = $true }
+Check 'shared csv refuses a non-Autopilot file and leaves it alone' ($threw -and ((Get-Content $bad -Raw) -like 'Name,Value*'))
+
 "`nFAILURES: $fails"
 Remove-Item $tmp -Recurse -Force
 if ($fails -gt 0) { exit 1 }

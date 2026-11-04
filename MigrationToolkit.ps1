@@ -12,6 +12,7 @@ param(
     [string]$Action = 'Gui',
     [string]$GroupTag = '',
     [string]$Folder = '',
+    [string]$SharedCsv = '',
     [string]$Serial = '',
     [ValidateRange(0, 3)][int]$Phase = 0,
     [string]$ExpectSerial = '',
@@ -44,6 +45,7 @@ if ($Action -ne 'Gui') {
     if ($GroupTag)     { $p.GroupTag = $GroupTag }
     if ($Folder)       { $p.Folder = $Folder; $p.OutputFolder = $Folder }
     if ($Serial)       { $p.Serial = $Serial }
+    if ($SharedCsv)    { $p.SharedCsv = $SharedCsv }
     if ($ExpectSerial) { $p.ExpectSerial = $ExpectSerial }
     if ($Action -eq 'MergeCsv' -and -not $Folder) { $p.Folder = Join-Path $PSScriptRoot 'Output\Autopilot' }
 
@@ -58,6 +60,7 @@ if ($Action -ne 'Gui') {
         $o = @{}
         if ($GroupTag) { $o.GroupTag = $GroupTag }
         if ($Folder)   { $o.OutputFolder = $Folder }
+        if ($SharedCsv) { $o.SharedCsv = $SharedCsv }
         if ($PSBoundParameters.ContainsKey('SkipHash'))        { $o.CaptureHash = -not $SkipHash }
         if ($PSBoundParameters.ContainsKey('UploadHash'))      { $o.UploadHash = [bool]$UploadHash }
         if ($PSBoundParameters.ContainsKey('SkipDebloat'))     { $o.Debloat = -not $SkipDebloat }
@@ -710,7 +713,7 @@ Add-ActionRow $stepsPage.Table '8. Cleanup (debloat)' 'Removes the configured Ap
 $ap = New-Page 'Autopilot'
 Add-Heading $ap.Table 'Group tags and hardware hash' 'The group tag decides which Autopilot profile a device gets. Create new tags here; they are saved and offered everywhere.'
 $tagCard = New-Card
-$tagCard.Dock = 'Fill'; $tagCard.Height = 150; $tagCard.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10); $tagCard.Padding = New-Object System.Windows.Forms.Padding(18, 14, 18, 10)
+$tagCard.Dock = 'Fill'; $tagCard.Height = 215; $tagCard.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 10); $tagCard.Padding = New-Object System.Windows.Forms.Padding(18, 14, 18, 10)
 $tl1 = New-Label 'Group tag' $Fnt.Body $Pal.Muted $Pal.Card; $tl1.Location = New-Object System.Drawing.Point(0, 6); $tl1.Size = New-Object System.Drawing.Size(80, 24)
 $script:TagBoxAp = New-TagCombo; $script:TagBoxAp.Location = New-Object System.Drawing.Point(84, 3); $script:TagBoxAp.Width = 280
 $btnNewTag = New-Btn 'New tag' 'Primary' 100 30; $btnNewTag.Location = New-Object System.Drawing.Point(376, 1); $btnNewTag.Font = $Fnt.Small
@@ -727,10 +730,26 @@ $btnBrowse.Add_Click({
     if (Test-Path $script:OutBox.Text) { $d.SelectedPath = $script:OutBox.Text }
     if ($d.ShowDialog() -eq 'OK') { $script:OutBox.Text = $d.SelectedPath }
 })
-$tl3 = New-Label 'Files are named <serial>_AutoPilotSetup.csv and carry the tag. A USB drive is fine; a network share is allowed but flagged in the log.' $Fnt.Small $Pal.Muted $Pal.Card
-$tl3.Location = New-Object System.Drawing.Point(0, 94); $tl3.Size = New-Object System.Drawing.Size(640, 36)
-$tagCard.Controls.AddRange(@($tl1, $script:TagBoxAp, $btnNewTag, $btnDelTag, $tl2, $script:OutBox, $btnBrowse, $tl3))
-$script:ActionButtons.Add($btnNewTag); $script:ActionButtons.Add($btnDelTag); $script:ActionButtons.Add($btnBrowse)
+$script:ChkShared = New-Object System.Windows.Forms.CheckBox
+$script:ChkShared.Text = 'Also add to one shared CSV'; $script:ChkShared.Font = $Fnt.Body; $script:ChkShared.ForeColor = $Pal.Ink; $script:ChkShared.BackColor = $Pal.Card
+$script:ChkShared.Location = New-Object System.Drawing.Point(0, 98); $script:ChkShared.Size = New-Object System.Drawing.Size(260, 26)
+$script:SharedBox = New-Object System.Windows.Forms.TextBox
+$script:SharedBox.Location = New-Object System.Drawing.Point(84, 128); $script:SharedBox.Width = 400; $script:SharedBox.Font = $Fnt.Body
+$script:SharedBox.Text = Join-Path $PSScriptRoot 'Output\Autopilot\AutopilotHashes.csv'; $script:SharedBox.Enabled = $false
+$tl4 = New-Label 'Shared CSV' $Fnt.Body $Pal.Muted $Pal.Card; $tl4.Location = New-Object System.Drawing.Point(0, 131); $tl4.Size = New-Object System.Drawing.Size(80, 24)
+$btnBrowseShared = New-Btn 'Browse' 'Secondary' 90 30; $btnBrowseShared.Location = New-Object System.Drawing.Point(496, 126); $btnBrowseShared.Font = $Fnt.Small; $btnBrowseShared.Enabled = $false
+$btnBrowseShared.Add_Click({
+    $d = New-Object System.Windows.Forms.SaveFileDialog
+    $d.Filter = 'CSV file (*.csv)|*.csv'; $d.OverwritePrompt = $false; $d.CheckFileExists = $false; $d.FileName = 'AutopilotHashes.csv'
+    $cur = $script:SharedBox.Text.Trim()
+    if ($cur) { $dir = Split-Path -Parent $cur; if ($dir -and (Test-Path $dir)) { $d.InitialDirectory = $dir }; $d.FileName = Split-Path -Leaf $cur }
+    if ($d.ShowDialog() -eq 'OK') { $script:SharedBox.Text = $d.FileName }
+})
+$script:ChkShared.Add_CheckedChanged({ $script:SharedBox.Enabled = $script:ChkShared.Checked; $btnBrowseShared.Enabled = $script:ChkShared.Checked })
+$tl3 = New-Label 'Each device always gets its own <serial>_AutoPilotSetup.csv in the folder above. With the shared CSV on, the device is also added to that one file: one header row, one line per device, a re-run replaces its own line. If the file is on a network share, capture BEFORE the AD unjoin.' $Fnt.Small $Pal.Muted $Pal.Card
+$tl3.Location = New-Object System.Drawing.Point(0, 162); $tl3.Size = New-Object System.Drawing.Size(660, 48)
+$tagCard.Controls.AddRange(@($tl1, $script:TagBoxAp, $btnNewTag, $btnDelTag, $tl2, $script:OutBox, $btnBrowse, $script:ChkShared, $tl4, $script:SharedBox, $btnBrowseShared, $tl3))
+$script:ActionButtons.Add($btnNewTag); $script:ActionButtons.Add($btnDelTag); $script:ActionButtons.Add($btnBrowse); $script:ActionButtons.Add($btnBrowseShared)
 Add-ToTable $ap.Table $tagCard
 Add-ActionRow $ap.Table 'Capture this device''s hash' 'Reads the hash from WMI (no internet or gallery module needed) and writes <serial>_AutoPilotSetup.csv with the group tag above.' @{ Name = 'CaptureHash'; Needs = 'GroupTag' } 'Capture'
 Add-ActionRow $ap.Table 'Merge CSVs in folder' 'Validates, de-duplicates by serial and writes one Consolidated<timestamp>.csv. Ignores earlier Consolidated* files.' @{ Name = 'MergeCsv'; Needs = 'Folder' } 'Merge'
@@ -883,9 +902,14 @@ function Update-DeviceCard {
     if ($s.Sccm) { Set-Chip $script:ChipSccm 'SCCM: present' 'warn' } else { Set-Chip $script:ChipSccm 'SCCM: none' 'ok' }
 }
 
+function Get-SharedCsvPath {
+    if ($script:ChkShared.Checked) { return $script:SharedBox.Text.Trim() }
+    ''
+}
+
 function Get-AutoOption {
     @{
-        GroupTag = $script:TagBoxAuto.Text.Trim(); OutputFolder = $script:OutBox.Text.Trim()
+        GroupTag = $script:TagBoxAuto.Text.Trim(); OutputFolder = $script:OutBox.Text.Trim(); SharedCsv = (Get-SharedCsvPath)
         CaptureHash = $script:ChkHash.Checked; UploadHash = $script:ChkUpload.Checked
         CheckCompliance = $script:ChkCompliance.Checked; LaunchProfwiz = $script:ChkProf.Checked; Debloat = $script:ChkDebloat.Checked; RemoveTempAdmin = $script:ChkTempAdmin.Checked
     }
@@ -984,6 +1008,7 @@ function Get-UiParam {
             } elseif ((Show-Message 'No group tag is selected, so the device is captured with an empty tag and gets no tag-based profile. Continue?' 'No group tag' 'YesNo' 'Warning') -ne 'Yes') { return $null }
             $p.GroupTag = $tag
             $p.OutputFolder = $script:OutBox.Text.Trim()
+            $p.SharedCsv = Get-SharedCsvPath
         }
         'Folder' { $p.Folder = $script:OutBox.Text.Trim() }
         'CsvFile' {

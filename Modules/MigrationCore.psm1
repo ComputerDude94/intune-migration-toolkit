@@ -1017,6 +1017,48 @@ function Save-AutopilotRow {
     $rows | Export-Csv -Path $Path -NoTypeInformation -Encoding ASCII
 }
 
+function Add-AutopilotSharedRow {
+    # One central CSV: a single header row, then one line per device. Safe for several technicians at once -
+    # the file is opened exclusively (others wait their turn), this device's old row is replaced, never duplicated.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Info, [string]$GroupTag = '', [int]$TimeoutSec = 60)
+    $cols = 'Device Serial Number', 'Windows Product ID', 'Hardware Hash', 'Group Tag'
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $fs = $null
+    while (-not $fs) {
+        try { $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None) }
+        catch [System.IO.IOException] {
+            $busy = (($_.Exception.HResult -band 0xFFFF) -in 32, 33)
+            if (-not $busy) { throw }
+            if ((Get-Date) -gt $deadline) { throw "The shared CSV is in use by someone else ($Path). Try again in a moment." }
+            Start-Sleep -Milliseconds (200 + (Get-Random -Maximum 400))
+        }
+    }
+    try {
+        $reader = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::ASCII, $true, 4096, $true)
+        $text = $reader.ReadToEnd()
+        $keep = New-Object System.Collections.Generic.List[object]
+        if ($text.Trim()) {
+            $existing = @($text | ConvertFrom-Csv)
+            $head = @(($text -split "`r?`n")[0] -split ',' | ForEach-Object { $_.Trim('"') })
+            foreach ($c in $cols) { if ($head -notcontains $c) { throw "$Path is not an Autopilot CSV (missing column '$c'). Nothing was changed." } }
+            foreach ($r in $existing) {
+                if ("$($r.'Device Serial Number')".Trim() -ne $Info.Serial) {
+                    $keep.Add([pscustomobject][ordered]@{ 'Device Serial Number' = $r.'Device Serial Number'; 'Windows Product ID' = $r.'Windows Product ID'; 'Hardware Hash' = $r.'Hardware Hash'; 'Group Tag' = $r.'Group Tag' })
+                }
+            }
+        }
+        $keep.Add([pscustomobject][ordered]@{ 'Device Serial Number' = $Info.Serial; 'Windows Product ID' = $Info.ProductId; 'Hardware Hash' = $Info.Hash; 'Group Tag' = $GroupTag })
+        $csv = (($keep | ConvertTo-Csv -NoTypeInformation) -join "`r`n") + "`r`n"
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($csv)
+        $fs.SetLength(0)
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Flush()
+    } finally { $fs.Dispose() }
+    $keep.Count
+}
+
 function Get-HashCsvPath {
     param([string]$OutputFolder)
     if (-not $OutputFolder) { $OutputFolder = Join-Path $script:ToolkitRoot 'Output\Autopilot' }
@@ -1025,8 +1067,10 @@ function Get-HashCsvPath {
 }
 
 function Invoke-AutopilotCapture {
-    param([string]$GroupTag = '', [string]$OutputFolder)
+    param([string]$GroupTag = '', [string]$OutputFolder, [string]$SharedCsv = '')
     if (-not $OutputFolder) { $OutputFolder = Join-Path $script:ToolkitRoot 'Output\Autopilot' }
+    $SharedCsv = "$SharedCsv".Trim()
+    if ($SharedCsv -and ($SharedCsv -notlike '*.csv' -or $SharedCsv -match '[*?]')) { throw "Shared CSV must be a single .csv file path: $SharedCsv" }
     $GroupTag = "$GroupTag".Trim()
     if (-not $GroupTag) { Write-ToolkitLog 'No group tag selected - the device will be captured with an empty tag.' 'WARN' }
     else {
@@ -1042,6 +1086,15 @@ function Invoke-AutopilotCapture {
         Save-AutopilotRow -Path $file -Info $info -GroupTag $GroupTag
     } | Out-Null
     Write-ToolkitLog "Captured $($info.Serial) (hash length $($info.Hash.Length), tag '$GroupTag')." 'OK'
+    if ($SharedCsv) {
+        if (Test-NetworkPath $SharedCsv) { Write-ToolkitLog "Shared CSV $SharedCsv is on the network; it is written with the signed-in account's access, so do this BEFORE leaving the domain." 'WARN' }
+        try {
+            Invoke-Mutation "add serial $($info.Serial) to shared CSV $SharedCsv" {
+                $n = Add-AutopilotSharedRow -Path $SharedCsv -Info $info -GroupTag $GroupTag
+                Write-ToolkitLog "Shared CSV now holds $n device(s): $SharedCsv" 'OK'
+            } | Out-Null
+        } catch { throw "Could not add this device to the shared CSV: $($_.Exception.Message) Its own file was saved at $file." }
+    }
     $file
 }
 
@@ -1395,7 +1448,7 @@ function Format-Duration { param([double]$Seconds) $t = [timespan]::FromSeconds(
 function Resolve-RunOption {
     param($Saved, [hashtable]$New = @{})
     $o = @{
-        GroupTag = ''; OutputFolder = (Join-Path $script:ToolkitRoot 'Output\Autopilot')
+        GroupTag = ''; OutputFolder = (Join-Path $script:ToolkitRoot 'Output\Autopilot'); SharedCsv = ''
         CaptureHash = $true; UploadHash = $false; Offline = $false
         Debloat = $true; LaunchProfwiz = $true; RemoveTempAdmin = $false; CheckCompliance = $false
     }
@@ -1528,7 +1581,7 @@ function Invoke-RunStep {
         }
         'Report' { $f = New-MigrationReport; $st = 'Done'; if ($script:DryRun) { $st = 'DryRun' }; Set-RunOutcome $st ([string]$f) }
         'CaptureHash' {
-            $file = Invoke-AutopilotCapture -GroupTag $Options.GroupTag -OutputFolder $Options.OutputFolder
+            $file = Invoke-AutopilotCapture -GroupTag $Options.GroupTag -OutputFolder $Options.OutputFolder -SharedCsv ([string]$Options.SharedCsv)
             $st = 'Done'; if ($script:DryRun) { $st = 'DryRun' }
             Set-RunOutcome $st ([string]$file)
         }
@@ -1609,7 +1662,7 @@ function Invoke-MigrationRun {
     $plan = @{
         Version = 1; Created = (Get-Date).ToString('s'); Updated = ''; Phase = $FromPhase; Status = 'InProgress'; Message = ''
         Device = @{ ComputerName = $target.ComputerName; Serial = $target.Serial; MachineGuid = $target.MachineGuid }
-        Options = @{ GroupTag = $opt.GroupTag; OutputFolder = $opt.OutputFolder; CaptureHash = [bool]$opt.CaptureHash; UploadHash = [bool]$opt.UploadHash
+        Options = @{ GroupTag = $opt.GroupTag; OutputFolder = $opt.OutputFolder; SharedCsv = [string]$opt.SharedCsv; CaptureHash = [bool]$opt.CaptureHash; UploadHash = [bool]$opt.UploadHash
                      Offline = [bool]$opt.Offline; Debloat = [bool]$opt.Debloat; LaunchProfwiz = [bool]$opt.LaunchProfwiz; RemoveTempAdmin = [bool]$opt.RemoveTempAdmin; CheckCompliance = [bool]$opt.CheckCompliance }
         Steps = (New-Object System.Collections.ArrayList)
     }
@@ -1708,7 +1761,7 @@ function Invoke-ToolkitAction {
             'ProfileWizard'    { Start-ProfileWizard }
             'Debloat'          { Invoke-Debloat }
             'RunMCPR'          { Invoke-ToolExecutable -Name 'MCPR.exe' }
-            'CaptureHash'      { [void](Invoke-AutopilotCapture -GroupTag $Params.GroupTag -OutputFolder $Params.OutputFolder) }
+            'CaptureHash'      { [void](Invoke-AutopilotCapture -GroupTag $Params.GroupTag -OutputFolder $Params.OutputFolder -SharedCsv ([string]$Params.SharedCsv)) }
             'MergeCsv'         { [void](Merge-AutopilotCsv -Folder $Params.Folder) }
             'InstallGraph'     { Install-GraphModule }
             'GraphSignIn'      { Connect-IntuneGraph }
